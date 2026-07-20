@@ -107,8 +107,12 @@ impl CoinStateCache {
     /// DISCOVERY — a new coin under a watched puzzle hash is legitimate). An unsolicited item
     /// matching neither is DROPPED, so a hostile peer cannot inject coins that later answer a
     /// cache-first read. Inserts are further bounded by [`max_cached_coins`](Self::max_cached_coins)
-    /// so a puzzle-hash subscription cannot be used to exhaust memory. The peak ADVANCES on a normal
-    /// update but is set DOWN on an authoritative reorg (a fork below the current peak).
+    /// so a puzzle-hash subscription cannot be used to exhaust memory.
+    ///
+    /// The peak ADVANCES on a normal update, and is set DOWN ONLY for a GENUINE authoritative reorg —
+    /// one where the rollback actually changed subscribed state, `fork_height` is below the current
+    /// peak, and the update is well-formed (`height >= fork_height`). An empty/garbage update that
+    /// rolls back nothing, or one with `height < fork_height`, cannot lower the peak.
     ///
     /// See the module docs for the reorg-rollback rules.
     pub fn apply_update(
@@ -124,23 +128,42 @@ impl CoinStateCache {
             .map(|s| s.coin.coin_id())
             .collect();
 
+        // Track whether the rollback ACTUALLY changed subscribed state — peak-down is gated on this
+        // so it can never fire with a weaker precondition than the rollback itself.
+        let mut rolled_back = false;
         self.coins.retain(|id, state| {
             if reasserted.contains(id) {
                 return true; // overwritten below with the authoritative state
             }
             if state.created_height.is_some_and(|h| h > fork_height) {
+                rolled_back = true;
                 return false; // created in a block the reorg erased and not re-asserted
             }
             if state.spent_height.is_some_and(|h| h > fork_height) {
                 state.spent_height = None; // its spend was rolled back — unspend it
+                rolled_back = true;
             }
             true
         });
+
+        // A peak-down is honoured ONLY for a GENUINE authoritative reorg: the rollback above changed
+        // real subscribed state, the fork is below the current peak, AND the update is well-formed
+        // (a real reorg tip is never below its own fork point). Otherwise the peak stays advance-only,
+        // so a hostile empty/garbage update cannot pin the peak arbitrarily low.
+        let is_genuine_reorg = rolled_back
+            && height >= fork_height
+            && self.peak.is_some_and(|(current, _)| fork_height < current);
 
         let max_coins = self.max_cached_coins();
         for state in items {
             if !self.is_subscribed(state) {
                 continue; // drop unsolicited coins from a hostile/noisy peer
+            }
+            // On an authoritative reorg, refuse a coin claimed to be created ABOVE the new tip — it
+            // cannot exist on the post-reorg chain, and caching it would break the
+            // "no cached coin created above the peak" invariant.
+            if is_genuine_reorg && state.created_height.is_some_and(|h| h > height) {
+                continue;
             }
             let id = state.coin.coin_id();
             // Re-asserting an already-cached coin never grows the map; a NEW coin is admitted only
@@ -152,15 +175,11 @@ impl CoinStateCache {
             self.coins.insert(id, *state);
         }
 
-        // An AUTHORITATIVE reorg — a fork below the current peak, the SAME signal that drove the
-        // coin-state rollback above — sets the peak DOWN to the update's authoritative value, so
-        // confirmation counts do not overstate during a genuine deep down-reorg. A normal forward
-        // update (no rollback) stays advance-only, matching the bare-`NewPeakWallet` path's
-        // hostile-low-peak resistance. Lowering is confined to THIS authoritative-reorg branch: it
-        // adds no trust beyond the coin-state rollback this same update already performs.
-        if self.peak.is_some_and(|(current, _)| fork_height < current) {
+        if is_genuine_reorg {
             self.peak = Some((height, peak_hash));
         } else {
+            // Advance-only (matching the bare-`NewPeakWallet` path): a normal forward update advances
+            // the peak; a stale/empty/malformed update never regresses it.
             self.set_peak(height, peak_hash);
         }
     }
@@ -319,16 +338,58 @@ mod tests {
 
     // ---- #1311: peak-down on an authoritative reorg, advance-only otherwise ----
 
-    /// An authoritative reorg (a `CoinStateUpdate` whose `fork_height` is below the current peak)
-    /// LOWERS the peak to the update's height/hash — otherwise confirmation counts overstate during
-    /// a genuine deep down-reorg.
+    /// A GENUINE authoritative reorg — one that actually drops a subscribed coin created above the
+    /// fork — LOWERS the peak to the update's height/hash, so confirmation counts do not overstate.
+    #[test]
+    fn genuine_reorg_rollback_lowers_peak() {
+        let mut cache = CoinStateCache::new();
+        let orphaned = state(1, Some(95), None); // created above the fork
+        cache.track_coins([orphaned.coin.coin_id()]);
+        cache.seed([orphaned]);
+        cache.set_peak(100, Bytes32::new([0xaa; 32]));
+
+        // fork 90 < peak 100, height 92 >= fork, and the rollback drops the coin created at 95.
+        cache.apply_update(&[], 92, 90, Bytes32::new([0xbb; 32]));
+        assert_eq!(cache.peak(), Some((92, Bytes32::new([0xbb; 32]))));
+    }
+
+    /// Alias kept for the historical name: an authoritative reorg lowers the peak (same as
+    /// [`genuine_reorg_rollback_lowers_peak`]).
     #[test]
     fn authoritative_reorg_lowers_peak() {
         let mut cache = CoinStateCache::new();
+        let orphaned = state(2, Some(95), None);
+        cache.track_coins([orphaned.coin.coin_id()]);
+        cache.seed([orphaned]);
         cache.set_peak(100, Bytes32::new([0xaa; 32]));
-        // fork_height 89 < current peak 100 → a genuine rollback; the new peak is authoritative.
         cache.apply_update(&[], 90, 89, Bytes32::new([0xbb; 32]));
         assert_eq!(cache.peak(), Some((90, Bytes32::new([0xbb; 32]))));
+    }
+
+    /// A `CoinStateUpdate` that rolls back NOTHING (empty items, no subscribed coin above the fork)
+    /// must NOT lower the peak, even though `fork_height < peak` — a hostile empty update cannot pin
+    /// the peak arbitrarily low.
+    #[test]
+    fn empty_update_with_low_fork_does_not_lower_peak() {
+        let mut cache = CoinStateCache::new();
+        cache.set_peak(1_000_000, Bytes32::new([0xaa; 32]));
+        cache.apply_update(&[], 7, 5, Bytes32::new([0xbb; 32]));
+        assert_eq!(cache.peak(), Some((1_000_000, Bytes32::new([0xaa; 32]))));
+    }
+
+    /// A malformed reorg whose `height < fork_height` (impossible on a real chain) must NOT lower the
+    /// peak, even if the rollback changed state.
+    #[test]
+    fn peak_height_below_fork_height_is_rejected() {
+        let mut cache = CoinStateCache::new();
+        let orphaned = state(3, Some(60), None); // created above the (malformed) fork
+        cache.track_coins([orphaned.coin.coin_id()]);
+        cache.seed([orphaned]);
+        cache.set_peak(100, Bytes32::new([0xaa; 32]));
+
+        // height 40 < fork 50 → malformed; rollback may drop the coin but the peak must not lower.
+        cache.apply_update(&[], 40, 50, Bytes32::new([0xbb; 32]));
+        assert_eq!(cache.peak(), Some((100, Bytes32::new([0xaa; 32]))));
     }
 
     /// A bare `NewPeakWallet` (the `set_peak` path) with a LOWER height must NOT lower the peak —
@@ -349,5 +410,36 @@ mod tests {
         cache.set_peak(100, Bytes32::new([0xaa; 32]));
         cache.apply_update(&[], 101, 100, Bytes32::new([0xcc; 32]));
         assert_eq!(cache.peak(), Some((101, Bytes32::new([0xcc; 32]))));
+    }
+
+    /// Invariant: after an authoritative peak-down, no cached coin has a `created_height` above the
+    /// new peak — coins created above the fork are dropped, and an item claimed above the new tip is
+    /// refused.
+    #[test]
+    fn invariant_no_cached_coin_created_above_peak_after_reorg() {
+        let mut cache = CoinStateCache::new();
+        let below = state(1, Some(50), None); // survives the reorg
+        let orphaned = state(2, Some(95), None); // created above the fork → dropped
+        cache.track_coins([below.coin.coin_id(), orphaned.coin.coin_id()]);
+        cache.seed([below, orphaned]);
+        cache.set_peak(100, Bytes32::new([0xaa; 32]));
+
+        // A hostile item claims to be created ABOVE the new tip (99 > 92); it must be refused.
+        let above_tip = state(3, Some(99), None);
+        let above_tip_id = above_tip.coin.coin_id();
+        cache.track_coins([above_tip_id]);
+        cache.apply_update(&[above_tip], 92, 90, Bytes32::new([0xbb; 32]));
+
+        let (peak_height, _) = cache.peak().expect("peak set");
+        assert_eq!(peak_height, 92);
+        assert_eq!(cache.get(above_tip_id), None, "above-tip coin is refused");
+        for id in [below.coin.coin_id(), orphaned.coin.coin_id(), above_tip_id] {
+            if let Some(cs) = cache.get(id) {
+                assert!(
+                    cs.created_height.is_none_or(|h| h <= peak_height),
+                    "cached coin {id:?} created above peak {peak_height}"
+                );
+            }
+        }
     }
 }
