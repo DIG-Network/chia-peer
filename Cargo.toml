@@ -17,9 +17,10 @@ categories = ["api-bindings", "cryptography::cryptocurrencies"]
 dig-chainsource-interface = "0.1"
 chia = "0.26"
 chia-protocol = "0.26"
-chia-wallet-sdk = { version = "0.34", features = ["native-tls"] }
+chia-wallet-sdk = { version = "0.30", features = ["native-tls"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
+async-trait = "0.1"
 thiserror = "2"
 hex = "0.4"
 log = "0.4"
@@ -29,6 +30,9 @@ futures-util = "0.3"
 [dev-dependencies]
 # `testing` feature enables the in-memory MockChainSource used by provider tests.
 dig-chainsource-interface = { version = "0.1", features = ["testing"] }
+# `peer-simulator` provides an in-process wallet-protocol full node so the peer fetcher + light
+# client are tested end-to-end (connect, subscribe, submit, reorg) without a live network.
+chia-wallet-sdk = { version = "0.30", features = ["native-tls", "peer-simulator"] }
 
 # Linux-only vendored OpenSSL for the native TLS stack (matches chia-query's
 # native build so CI links the same way).
