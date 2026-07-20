@@ -308,3 +308,5 @@ mod tests {
         );
     }
 }
+
+// #1311: peak-down-reorg confirmation-accuracy hardening (in progress).
