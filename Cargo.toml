@@ -1,0 +1,37 @@
+[package]
+name = "chia-peer"
+version = "0.1.0"
+edition = "2021"
+description = "DIG Chia light-client connectivity: a wallet-protocol full-node client + ChainSource provider (dig-node seam 1)"
+license = "MIT"
+repository = "https://github.com/DIG-Network/chia-peer"
+readme = "README.md"
+keywords = ["chia", "blockchain", "light-client", "wallet-protocol", "peer"]
+categories = ["api-bindings", "cryptography::cryptocurrencies"]
+
+[dependencies]
+# The canonical reads-only ChainSource provider interface this crate implements.
+# `chia-protocol` is pulled in directly so the provider speaks the exact
+# `chia_protocol` types the interface exposes (cargo unifies it with the SDK's
+# re-export at the same 0.26.x).
+dig-chainsource-interface = "0.1"
+chia = "0.26"
+chia-protocol = "0.26"
+chia-wallet-sdk = { version = "0.34", features = ["native-tls"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+thiserror = "2"
+hex = "0.4"
+log = "0.4"
+rand = "0.8"
+futures-util = "0.3"
+
+[dev-dependencies]
+# `testing` feature enables the in-memory MockChainSource used by provider tests.
+dig-chainsource-interface = { version = "0.1", features = ["testing"] }
+
+# Linux-only vendored OpenSSL for the native TLS stack (matches chia-query's
+# native build so CI links the same way).
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+openssl-sys = { version = "0.9", features = ["vendored"] }
