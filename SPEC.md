@@ -58,13 +58,19 @@ inbound `Message` stream:
   1. **Reorg rollback across `fork_height`:** a cached coin *created* above the fork that the update
      does not re-assert is dropped (it no longer exists); a cached coin *spent* above the fork has its
      spent height cleared (its spend was rolled back), unless the update re-asserts it.
-  2. **Authoritative overwrite:** every subscribed coin in `items` overwrites the cache.
-  3. **Peak update:** an **authoritative reorg** — `fork_height` below the current peak, the same
-     signal driving the rollback in (1) — sets the peak DOWN to `(height, peak_hash)`, so
-     confirmation counts do not overstate during a genuine deep down-reorg. A normal forward update
-     (no rollback) is advance-only. Peak-lowering is confined to this authoritative-reorg branch; it
-     adds no trust beyond the coin-state rollback the same update already performs, and a bare
-     `NewPeakWallet` can never lower the peak.
+  2. **Authoritative overwrite:** every subscribed coin in `items` overwrites the cache, EXCEPT an
+     item claiming creation above this update's own tip (`created_height > height`) — impossible on
+     any real chain — which is refused on ALL paths (forward and reorg).
+  3. **Peak update:** an **authoritative reorg** — `fork_height` below the current peak, the rollback
+     in (1) actually changed subscribed state, and the update is well-formed (`height >= fork_height`)
+     — sets the peak DOWN to `(height, peak_hash)`, so confirmation counts do not overstate during a
+     genuine deep down-reorg. A normal forward update, an update that rolls back nothing, or one with
+     `height < fork_height` is advance-only. Peak-lowering adds no trust beyond the coin-state
+     rollback the same update already performs, and a bare `NewPeakWallet` can never lower the peak.
+
+  **Invariant (all paths):** after any `apply_update`, no cached coin has `created_height >
+  peak_height` — so a consumer's `peak_height - created_height` confirmation count can never underflow
+  into a spurious hyper-confirmed value.
 - Coins reported as spent are dropped from the local subscription set (their state is retained for
   reads; only the live subscription is released).
 

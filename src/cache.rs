@@ -114,6 +114,10 @@ impl CoinStateCache {
     /// peak, and the update is well-formed (`height >= fork_height`). An empty/garbage update that
     /// rolls back nothing, or one with `height < fork_height`, cannot lower the peak.
     ///
+    /// An item claiming creation ABOVE this update's own tip (`created_height > height`) is refused on
+    /// EVERY path (forward and reorg). Combined with the rollback, this upholds a hard invariant:
+    /// after any `apply_update`, no cached coin has `created_height > peak_height`.
+    ///
     /// See the module docs for the reorg-rollback rules.
     pub fn apply_update(
         &mut self,
@@ -159,10 +163,11 @@ impl CoinStateCache {
             if !self.is_subscribed(state) {
                 continue; // drop unsolicited coins from a hostile/noisy peer
             }
-            // On an authoritative reorg, refuse a coin claimed to be created ABOVE the new tip — it
-            // cannot exist on the post-reorg chain, and caching it would break the
-            // "no cached coin created above the peak" invariant.
-            if is_genuine_reorg && state.created_height.is_some_and(|h| h > height) {
+            // Refuse a coin claimed to be created ABOVE this update's own tip — impossible on any
+            // real chain — on EVERY path (forward and reorg). This upholds the invariant that no
+            // cached coin has created_height > peak_height, so a `peak - created` confirmation count
+            // can never underflow into a spurious hyper-confirmed value.
+            if state.created_height.is_some_and(|h| h > height) {
                 continue;
             }
             let id = state.coin.coin_id();
@@ -410,6 +415,55 @@ mod tests {
         cache.set_peak(100, Bytes32::new([0xaa; 32]));
         cache.apply_update(&[], 101, 100, Bytes32::new([0xcc; 32]));
         assert_eq!(cache.peak(), Some((101, Bytes32::new([0xcc; 32]))));
+    }
+
+    /// A plain FORWARD update (rolls back nothing) carrying an item that claims creation above the
+    /// update's own tip must refuse that item — the above-tip guard applies on the forward path too,
+    /// not only on a reorg.
+    #[test]
+    fn forward_update_with_item_created_above_tip_is_refused() {
+        let mut cache = CoinStateCache::new();
+        cache.set_peak(1_000_000, Bytes32::new([0xaa; 32]));
+
+        // A forward update to tip 1_000_001 carrying a coin lying about created_height = 5_000_000.
+        let liar = state(1, Some(5_000_000), None);
+        let liar_id = liar.coin.coin_id();
+        cache.track_coins([liar_id]);
+        cache.apply_update(&[liar], 1_000_001, 1_000_000, Bytes32::new([0xbb; 32]));
+
+        assert_eq!(
+            cache.get(liar_id),
+            None,
+            "above-tip coin refused on forward path"
+        );
+    }
+
+    /// Invariant on the FORWARD path: after such an update, the peak is >= every cached coin's
+    /// created_height (no underflow surface for a `peak - created` confirmation count).
+    #[test]
+    fn invariant_no_cached_coin_above_peak_on_forward_path() {
+        let mut cache = CoinStateCache::new();
+        cache.set_peak(1_000_000, Bytes32::new([0xaa; 32]));
+
+        let honest = state(1, Some(999_999), None); // legitimately below the tip
+        let liar = state(2, Some(5_000_000), None); // above the tip → refused
+        cache.track_coins([honest.coin.coin_id(), liar.coin.coin_id()]);
+        cache.apply_update(
+            &[honest, liar],
+            1_000_001,
+            1_000_000,
+            Bytes32::new([0xbb; 32]),
+        );
+
+        let (peak_height, _) = cache.peak().expect("peak set");
+        for id in [honest.coin.coin_id(), liar.coin.coin_id()] {
+            if let Some(cs) = cache.get(id) {
+                assert!(
+                    cs.created_height.is_none_or(|h| h <= peak_height),
+                    "cached coin {id:?} created above peak {peak_height}"
+                );
+            }
+        }
     }
 
     /// Invariant: after an authoritative peak-down, no cached coin has a `created_height` above the
