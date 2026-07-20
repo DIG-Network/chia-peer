@@ -107,7 +107,8 @@ impl CoinStateCache {
     /// DISCOVERY — a new coin under a watched puzzle hash is legitimate). An unsolicited item
     /// matching neither is DROPPED, so a hostile peer cannot inject coins that later answer a
     /// cache-first read. Inserts are further bounded by [`max_cached_coins`](Self::max_cached_coins)
-    /// so a puzzle-hash subscription cannot be used to exhaust memory. The peak only ADVANCES.
+    /// so a puzzle-hash subscription cannot be used to exhaust memory. The peak ADVANCES on a normal
+    /// update but is set DOWN on an authoritative reorg (a fork below the current peak).
     ///
     /// See the module docs for the reorg-rollback rules.
     pub fn apply_update(
@@ -151,9 +152,17 @@ impl CoinStateCache {
             self.coins.insert(id, *state);
         }
 
-        // The peak only advances (matching `set_peak`); a stale/lower update never regresses it. A
-        // transient reorg dip is recovered by the next NewPeakWallet.
-        self.set_peak(height, peak_hash);
+        // An AUTHORITATIVE reorg — a fork below the current peak, the SAME signal that drove the
+        // coin-state rollback above — sets the peak DOWN to the update's authoritative value, so
+        // confirmation counts do not overstate during a genuine deep down-reorg. A normal forward
+        // update (no rollback) stays advance-only, matching the bare-`NewPeakWallet` path's
+        // hostile-low-peak resistance. Lowering is confined to THIS authoritative-reorg branch: it
+        // adds no trust beyond the coin-state rollback this same update already performs.
+        if self.peak.is_some_and(|(current, _)| fork_height < current) {
+            self.peak = Some((height, peak_hash));
+        } else {
+            self.set_peak(height, peak_hash);
+        }
     }
 
     /// Whether `state` belongs to the subscribed set: its coin id is subscribed, or its puzzle hash
@@ -256,8 +265,8 @@ mod tests {
         assert_eq!(cache.get(y_id), None);
         // Z stays but its rolled-back spend is cleared.
         assert_eq!(cache.get(z_id).and_then(|s| s.spent_height), None);
-        // The peak only advances: a reorg dip to 90 does NOT regress the tracked peak of 100.
-        assert_eq!(cache.peak(), Some((100, Bytes32::new([0xaa; 32]))));
+        // This is an authoritative reorg (fork 89 < peak 100), so the peak is set DOWN to 90.
+        assert_eq!(cache.peak(), Some((90, Bytes32::new([0xbb; 32]))));
     }
 
     #[test]
@@ -307,6 +316,38 @@ mod tests {
             "a coin discovered under a subscribed puzzle hash is accepted"
         );
     }
-}
 
-// #1311: peak-down-reorg confirmation-accuracy hardening (in progress).
+    // ---- #1311: peak-down on an authoritative reorg, advance-only otherwise ----
+
+    /// An authoritative reorg (a `CoinStateUpdate` whose `fork_height` is below the current peak)
+    /// LOWERS the peak to the update's height/hash — otherwise confirmation counts overstate during
+    /// a genuine deep down-reorg.
+    #[test]
+    fn authoritative_reorg_lowers_peak() {
+        let mut cache = CoinStateCache::new();
+        cache.set_peak(100, Bytes32::new([0xaa; 32]));
+        // fork_height 89 < current peak 100 → a genuine rollback; the new peak is authoritative.
+        cache.apply_update(&[], 90, 89, Bytes32::new([0xbb; 32]));
+        assert_eq!(cache.peak(), Some((90, Bytes32::new([0xbb; 32]))));
+    }
+
+    /// A bare `NewPeakWallet` (the `set_peak` path) with a LOWER height must NOT lower the peak —
+    /// this is the hostile-low-peak resistance and stays advance-only.
+    #[test]
+    fn bare_new_peak_lower_does_not_lower_peak() {
+        let mut cache = CoinStateCache::new();
+        cache.set_peak(100, Bytes32::new([0xaa; 32]));
+        cache.set_peak(90, Bytes32::new([0xbb; 32])); // bare NewPeakWallet, lower
+        assert_eq!(cache.peak(), Some((100, Bytes32::new([0xaa; 32]))));
+    }
+
+    /// A normal forward `CoinStateUpdate` (no rollback: `fork_height` at/above the current peak)
+    /// still advances the peak.
+    #[test]
+    fn normal_forward_update_advances_peak() {
+        let mut cache = CoinStateCache::new();
+        cache.set_peak(100, Bytes32::new([0xaa; 32]));
+        cache.apply_update(&[], 101, 100, Bytes32::new([0xcc; 32]));
+        assert_eq!(cache.peak(), Some((101, Bytes32::new([0xcc; 32]))));
+    }
+}
