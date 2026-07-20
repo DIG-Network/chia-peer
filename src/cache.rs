@@ -12,6 +12,19 @@
 //!
 //! The update's own `items` are authoritative for every coin they mention, so they overwrite the
 //! cache last. This keeps a read after a reorg from returning a coin state that the reorg erased.
+//!
+//! ## The confirmation-accuracy invariant (enforced by construction)
+//!
+//! No cached coin ever has `created_height > peak_height` — otherwise a consumer computing
+//! confirmations as `peak_height - created_height` (u32) would UNDERFLOW into a spurious
+//! ~4.29-billion "hyper-confirmed" value. This is not enforced per call site (that repeatedly missed
+//! a path); it is structural, enforced at two boundaries:
+//! - the **add boundary** — every coin enters via [`CoinStateCache::cache_coin`], which refuses a
+//!   coin created above the current peak (used by `apply_update`'s insert AND by `seed`);
+//! - the **peak boundary** — every peak change runs through [`CoinStateCache::update_peak`], which
+//!   sweeps out any coin now above the (possibly-lowered) peak.
+//!
+//! Together they make the invariant hold after every public mutation regardless of ordering.
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,12 +58,10 @@ impl CoinStateCache {
         self.peak
     }
 
-    /// Records a new peak observed from a `NewPeakWallet` message.
+    /// Records a new peak observed from a bare `NewPeakWallet` message. ADVANCE-ONLY: a stale,
+    /// out-of-order, or hostile lower peak never regresses a higher one.
     pub fn set_peak(&mut self, height: u32, header_hash: Bytes32) {
-        // Only advance the peak; a stale/out-of-order lower peak never regresses a higher one.
-        if self.peak.is_none_or(|(h, _)| height >= h) {
-            self.peak = Some((height, header_hash));
-        }
+        self.update_peak(height, header_hash, false);
     }
 
     /// The cached state of `coin_id`, if the client holds one.
@@ -58,11 +69,13 @@ impl CoinStateCache {
         self.coins.get(&coin_id).cloned()
     }
 
-    /// Seeds the cache with the coin states returned by an initial subscribe response, overwriting
-    /// any prior state for the same coin ids.
+    /// Seeds the cache with the coin states returned by an initial subscribe response.
+    ///
+    /// Routes through [`cache_coin`](Self::cache_coin), so a seeded coin created above the current
+    /// peak is refused (the invariant is enforced on this path too).
     pub fn seed(&mut self, states: impl IntoIterator<Item = CoinState>) {
         for state in states {
-            self.coins.insert(state.coin.coin_id(), state);
+            self.cache_coin(state);
         }
     }
 
@@ -114,9 +127,11 @@ impl CoinStateCache {
     /// peak, and the update is well-formed (`height >= fork_height`). An empty/garbage update that
     /// rolls back nothing, or one with `height < fork_height`, cannot lower the peak.
     ///
-    /// An item claiming creation ABOVE this update's own tip (`created_height > height`) is refused on
-    /// EVERY path (forward and reorg). Combined with the rollback, this upholds a hard invariant:
-    /// after any `apply_update`, no cached coin has `created_height > peak_height`.
+    /// The invariant — no cached coin has `created_height > peak_height` — is enforced BY
+    /// CONSTRUCTION, not per-call-site: every add routes through [`cache_coin`](Self::cache_coin)
+    /// (which refuses an above-peak coin), and every peak change runs a sweep via
+    /// [`update_peak`](Self::update_peak) (which drops any coin now above the peak). So the property
+    /// holds on all paths — forward, reorg, and seed — regardless of ordering.
     ///
     /// See the module docs for the reorg-rollback rules.
     pub fn apply_update(
@@ -137,7 +152,7 @@ impl CoinStateCache {
         let mut rolled_back = false;
         self.coins.retain(|id, state| {
             if reasserted.contains(id) {
-                return true; // overwritten below with the authoritative state
+                return true; // re-inserted with authoritative state below (or swept by update_peak)
             }
             if state.created_height.is_some_and(|h| h > fork_height) {
                 rolled_back = true;
@@ -158,35 +173,57 @@ impl CoinStateCache {
             && height >= fork_height
             && self.peak.is_some_and(|(current, _)| fork_height < current);
 
-        let max_coins = self.max_cached_coins();
+        // Set the peak FIRST (sweeping any survivor now above it — e.g. a reasserted coin kept by
+        // `retain` above a lowered peak), then admit the items against that peak via `cache_coin`.
+        self.update_peak(height, peak_hash, is_genuine_reorg);
+
         for state in items {
             if !self.is_subscribed(state) {
                 continue; // drop unsolicited coins from a hostile/noisy peer
             }
-            // Refuse a coin claimed to be created ABOVE this update's own tip — impossible on any
-            // real chain — on EVERY path (forward and reorg). This upholds the invariant that no
-            // cached coin has created_height > peak_height, so a `peak - created` confirmation count
-            // can never underflow into a spurious hyper-confirmed value.
-            if state.created_height.is_some_and(|h| h > height) {
-                continue;
-            }
-            let id = state.coin.coin_id();
-            // Re-asserting an already-cached coin never grows the map; a NEW coin is admitted only
-            // under the cap.
-            if !self.coins.contains_key(&id) && self.coins.len() >= max_coins {
-                log::warn!("chia-peer cache at cap ({max_coins}); dropping overflow coin state");
-                continue;
-            }
-            self.coins.insert(id, *state);
+            self.cache_coin(*state);
         }
+    }
 
-        if is_genuine_reorg {
-            self.peak = Some((height, peak_hash));
-        } else {
-            // Advance-only (matching the bare-`NewPeakWallet` path): a normal forward update advances
-            // the peak; a stale/empty/malformed update never regresses it.
-            self.set_peak(height, peak_hash);
+    /// The ONLY path by which a coin enters the cache. Enforces the two structural bounds:
+    /// - **Invariant:** refuses a coin whose `created_height` is above the current peak (which would
+    ///   underflow a consumer's `peak - created` confirmation count).
+    /// - **Memory:** refuses a NEW coin once the cache is at [`max_cached_coins`](Self::max_cached_coins)
+    ///   (re-asserting an already-cached coin never grows the map).
+    fn cache_coin(&mut self, state: CoinState) {
+        if let Some(created) = state.created_height {
+            if self
+                .peak
+                .is_some_and(|(peak_height, _)| created > peak_height)
+            {
+                return; // never cache a coin created above the peak
+            }
         }
+        let id = state.coin.coin_id();
+        if !self.coins.contains_key(&id) && self.coins.len() >= self.max_cached_coins() {
+            log::warn!("chia-peer cache at cap; dropping overflow coin state");
+            return;
+        }
+        self.coins.insert(id, state);
+    }
+
+    /// Sets the peak, then sweeps out every cached coin now above it — so the invariant holds after
+    /// ANY peak change. Advances unconditionally; lowers ONLY when `allow_lower` (a genuine
+    /// authoritative reorg). A bare `NewPeakWallet` (via [`set_peak`](Self::set_peak)) passes
+    /// `allow_lower = false`, so it can never regress the peak.
+    fn update_peak(&mut self, height: u32, header_hash: Bytes32, allow_lower: bool) {
+        let changed = match self.peak {
+            None => true,
+            Some((current, _)) => height >= current || allow_lower,
+        };
+        if !changed {
+            return;
+        }
+        self.peak = Some((height, header_hash));
+        // Drop any coin the (possibly-lowered) peak now sits below — e.g. a reasserted survivor kept
+        // across a reorg, or a coin seeded before the first peak arrived.
+        self.coins
+            .retain(|_, state| state.created_height.is_none_or(|h| h <= height));
     }
 
     /// Whether `state` belongs to the subscribed set: its coin id is subscribed, or its puzzle hash
@@ -235,6 +272,7 @@ mod tests {
         let mut cache = CoinStateCache::new();
         let s = state(1, Some(100), None);
         let id = s.coin.coin_id();
+        cache.track_coins([id]); // production always subscribes before seeding the response
         cache.seed([s]);
         assert_eq!(cache.get(id), Some(s));
     }
@@ -275,7 +313,7 @@ mod tests {
         // Z was created at 50 but SPENT at 93 (above the fork).
         let z_pre = state(3, Some(50), Some(93));
         let z_id = z_pre.coin.coin_id();
-        cache.track_coins([x_id]); // X is subscribed, so its re-assertion is accepted
+        cache.track_coins([x_id, y_id, z_id]); // subscribed before the seed response
         cache.seed([x_pre, y_pre, z_pre]);
         cache.set_peak(100, Bytes32::new([0xaa; 32]));
 
@@ -298,11 +336,10 @@ mod tests {
         let mut cache = CoinStateCache::new();
         let old = state(1, Some(10), None);
         let old_id = old.coin.coin_id();
-        cache.seed([old]);
-
         let fresh = state(2, Some(200), None);
         let fresh_id = fresh.coin.coin_id();
-        cache.track_coins([old_id, fresh_id]); // both subscribed
+        cache.track_coins([old_id, fresh_id]); // both subscribed before seeding
+        cache.seed([old]);
         cache.apply_update(&[fresh], 200, 199, Bytes32::new([0xcc; 32]));
 
         assert!(
@@ -493,6 +530,119 @@ mod tests {
                     cs.created_height.is_none_or(|h| h <= peak_height),
                     "cached coin {id:?} created above peak {peak_height}"
                 );
+            }
+        }
+    }
+
+    /// The exact 2-push exploit both gate legs used: a coin cached below the peak is re-asserted by a
+    /// reorg push that also drops another coin, lowering the peak below the re-asserted coin — the
+    /// survivor must be swept, not left above the peak.
+    #[test]
+    fn reassert_above_new_tip_during_peak_down_is_swept() {
+        let mut cache = CoinStateCache::new();
+        let c = state(1, Some(100), None); // will be re-asserted
+        let d = state(2, Some(150), None); // dropped by the reorg → triggers rolled_back
+        cache.track_coins([c.coin.coin_id(), d.coin.coin_id()]);
+        cache.seed([c, d]);
+        cache.set_peak(200, Bytes32::new([0xaa; 32]));
+
+        // Reorg to tip 50 (fork 40): D (created 150 > fork) drops → genuine peak-down to 50.
+        // C is re-asserted but created at 100 > new tip 50, so it must NOT remain cached.
+        cache.apply_update(&[c], 50, 40, Bytes32::new([0xbb; 32]));
+
+        assert_eq!(cache.peak(), Some((50, Bytes32::new([0xbb; 32]))));
+        assert_eq!(
+            cache.get(c.coin.coin_id()),
+            None,
+            "re-asserted coin above the lowered peak must be swept"
+        );
+    }
+
+    /// A coin seeded above an existing peak is refused; a coin seeded before any peak, then found
+    /// above the first peak, is swept when that peak arrives.
+    #[test]
+    fn seed_above_peak_is_refused_or_swept() {
+        // (a) seed above an existing peak → refused at the add boundary.
+        let mut cache = CoinStateCache::new();
+        cache.set_peak(100, Bytes32::new([0xaa; 32]));
+        let high = state(1, Some(200), None);
+        cache.track_coins([high.coin.coin_id()]);
+        cache.seed([high]);
+        assert_eq!(
+            cache.get(high.coin.coin_id()),
+            None,
+            "refused at add boundary"
+        );
+
+        // (b) seed before any peak, then a lower first peak sweeps it.
+        let mut cache = CoinStateCache::new();
+        let early = state(2, Some(200), None);
+        cache.track_coins([early.coin.coin_id()]);
+        cache.seed([early]); // peak is None → admitted (vacuously)
+        assert!(cache.get(early.coin.coin_id()).is_some());
+        cache.set_peak(100, Bytes32::new([0xaa; 32])); // first peak below it → swept
+        assert_eq!(
+            cache.get(early.coin.coin_id()),
+            None,
+            "seeded coin above the first peak must be swept"
+        );
+    }
+
+    /// Property/fuzz: across many random sequences of `apply_update`/`seed`/`set_peak` with arbitrary
+    /// inputs, the invariant "no cached coin has created_height > peak_height" holds after EVERY
+    /// operation. This exercises the input SPACE, not just hand-picked scenarios.
+    #[test]
+    fn property_invariant_holds_across_random_op_sequences() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        fn random_state(rng: &mut StdRng) -> CoinState {
+            let seed: u8 = rng.gen_range(0..8); // small id space → frequent re-asserts
+            let created = rng.gen_bool(0.85).then(|| rng.gen_range(0..1_000u32));
+            let spent = rng.gen_bool(0.3).then(|| rng.gen_range(0..1_000u32));
+            CoinState {
+                coin: Coin::new(Bytes32::new([seed; 32]), Bytes32::new([seed ^ 0xff; 32]), 1),
+                created_height: created,
+                spent_height: spent,
+            }
+        }
+
+        const SEQUENCES: usize = 3_000;
+        const OPS_PER_SEQUENCE: usize = 8;
+        let mut rng = StdRng::seed_from_u64(1311);
+
+        for _ in 0..SEQUENCES {
+            let mut cache = CoinStateCache::new();
+            for _ in 0..OPS_PER_SEQUENCE {
+                match rng.gen_range(0..3) {
+                    0 => {
+                        let s = random_state(&mut rng);
+                        cache.track_coins([s.coin.coin_id()]);
+                        cache.seed([s]);
+                    }
+                    1 => {
+                        let items: Vec<CoinState> = (0..rng.gen_range(0..4))
+                            .map(|_| random_state(&mut rng))
+                            .collect();
+                        for it in &items {
+                            cache.track_coins([it.coin.coin_id()]);
+                        }
+                        let height = rng.gen_range(0..1_000u32);
+                        let fork = rng.gen_range(0..1_000u32);
+                        cache.apply_update(&items, height, fork, Bytes32::new([rng.gen(); 32]));
+                    }
+                    _ => cache.set_peak(rng.gen_range(0..1_000u32), Bytes32::new([rng.gen(); 32])),
+                }
+
+                // The invariant, checked after every single operation.
+                if let Some((peak_height, _)) = cache.peak() {
+                    for state in cache.coins.values() {
+                        assert!(
+                            state.created_height.is_none_or(|h| h <= peak_height),
+                            "invariant violated: coin created {:?} > peak {peak_height}",
+                            state.created_height
+                        );
+                    }
+                }
             }
         }
     }
