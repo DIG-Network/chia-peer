@@ -52,15 +52,29 @@ provider implements. A single `chia-protocol` version across the read interface 
 The client keeps a local `CoinStateCache`, updated by a background drive-loop reading the peer's
 inbound `Message` stream:
 
-- **`NewPeakWallet`** advances the tracked peak `(height, header_hash)`. The peak only advances; a
-  stale, out-of-order lower peak never regresses a higher one.
+- **`NewPeakWallet`** advances the tracked peak `(height, header_hash)`. This path is ADVANCE-ONLY: a
+  stale, out-of-order, or hostile lower peak never regresses a higher one.
 - **`CoinStateUpdate`** carries `items`, `height`, `fork_height`, `peak_hash`. It is applied as:
   1. **Reorg rollback across `fork_height`:** a cached coin *created* above the fork that the update
      does not re-assert is dropped (it no longer exists); a cached coin *spent* above the fork has its
      spent height cleared (its spend was rolled back), unless the update re-asserts it.
-  2. **Authoritative overwrite:** every coin in `items` overwrites the cache.
-  3. **Peak set** to `(height, peak_hash)` — a reorg's new peak is authoritative even if numerically
-     lower than the previous one.
+  2. **Authoritative overwrite:** every subscribed coin in `items` is admitted through the single
+     cache-add path, which refuses any coin created above the current peak (see the invariant below).
+  3. **Peak update:** an **authoritative reorg** — `fork_height` below the current peak, the rollback
+     in (1) actually changed subscribed state, and the update is well-formed (`height >= fork_height`)
+     — sets the peak DOWN to `(height, peak_hash)`, so confirmation counts do not overstate during a
+     genuine deep down-reorg. A normal forward update, an update that rolls back nothing, or one with
+     `height < fork_height` is advance-only. Peak-lowering adds no trust beyond the coin-state
+     rollback the same update already performs, and a bare `NewPeakWallet` can never lower the peak.
+
+  **Invariant (structural, all paths — enforced BY CONSTRUCTION):** no cached coin ever has
+  `created_height > peak_height`, so a consumer's `peak_height - created_height` (u32) confirmation
+  count can never underflow into a spurious hyper-confirmed value. This is not a per-call-site check;
+  it holds at two boundaries: (a) the **add boundary** — every coin (from `apply_update`'s items AND
+  from `seed`) enters through one helper that refuses an above-peak coin; (b) the **peak boundary** —
+  every peak change (advance or authoritative-reorg lowering, including the first peak-set) sweeps out
+  any coin now above the peak. Together they make the property hold after every public mutation
+  regardless of ordering.
 - Coins reported as spent are dropped from the local subscription set (their state is retained for
   reads; only the live subscription is released).
 
