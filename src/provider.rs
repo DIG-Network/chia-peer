@@ -81,7 +81,11 @@ impl ChainSource for ChiaPeerProvider {
     type Error = ChainSourceError;
 
     fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
-        Ok(self.coin_state(coin_id)?.map(CoinRecord::from_coin_state))
+        let peak = self.peak_height()?;
+        Ok(self
+            .coin_state(coin_id)?
+            .map(CoinRecord::from_coin_state)
+            .map(|record| clamp_confirmed_to_peak(record, peak)))
     }
 
     fn coin_records_by_puzzle_hash(
@@ -102,9 +106,11 @@ impl ChainSource for ChiaPeerProvider {
                 .await
         })?
         .map_err(ChainSourceError::from)?;
+        let peak = self.peak_height()?;
         Ok(states
             .into_iter()
             .map(CoinRecord::from_coin_state)
+            .map(|record| clamp_confirmed_to_peak(record, peak))
             .collect())
     }
 
@@ -117,9 +123,11 @@ impl ChainSource for ChiaPeerProvider {
             fetcher.children(parent_coin_id).await
         })?
         .map_err(ChainSourceError::from)?;
+        let peak = self.peak_height()?;
         Ok(states
             .into_iter()
             .map(CoinRecord::from_coin_state)
+            .map(|record| clamp_confirmed_to_peak(record, peak))
             .collect())
     }
 
@@ -171,6 +179,30 @@ impl ChainSourceProvider for ChiaPeerProvider {
     fn provider_info(&self) -> ProviderInfo {
         self.info.clone()
     }
+}
+
+/// Bounds a record's reported `confirmed_height` by the current known peak.
+///
+/// The cache read path already upholds "no coin has `created_height > peak_height`" structurally
+/// (see [`CoinStateCache`](crate::cache::CoinStateCache)), but the cache-MISS *live-fetch* path
+/// surfaces the peer's `created_height` directly. An unsubscribed coin created in the current tip
+/// block — read in the one-block window before the drive loop processes the matching
+/// `NewPeakWallet` — would otherwise report `confirmed_height > peak_height`, underflowing a
+/// consumer's `peak_height - confirmed_height` (u32) confirmation count into a spurious ~4.29-billion
+/// value on a money path.
+///
+/// Clamping to `min(created, peak)` makes such a coin report 0 confirmations — the conservative,
+/// understating direction — while keeping it PRESENT (never omitted): the coin genuinely exists, so a
+/// false absence would be worse. The peak is left untouched (a lying peer must not be able to inflate
+/// it via a fetched coin). When no peak is known yet, `peak_height` is also `None`, so no
+/// `peak - confirmed` subtraction is possible and the height is left as reported.
+fn clamp_confirmed_to_peak(mut record: CoinRecord, peak: Option<u32>) -> CoinRecord {
+    if let (Some(confirmed), Some(peak)) = (record.confirmed_height, peak) {
+        if confirmed > peak {
+            record.confirmed_height = Some(peak);
+        }
+    }
+    record
 }
 
 /// Verifies a puzzle reveal hashes to `expected` (the coin's own puzzle hash), failing closed on a
@@ -272,14 +304,27 @@ mod tests {
     }
 
     fn provider_with(fetcher: MockFetcher) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
+        provider_with_peak(fetcher, None)
+    }
+
+    /// Builds a provider whose cache has been advanced to `peak` (if any), so the live-fetch clamp
+    /// against the known peak can be exercised.
+    fn provider_with_peak(
+        fetcher: MockFetcher,
+        peak: Option<u32>,
+    ) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .expect("multi-thread runtime");
+        let mut cache = CoinStateCache::new();
+        if let Some(height) = peak {
+            cache.set_peak(height, Bytes32::new([0xAB; 32]));
+        }
         let provider = ChiaPeerProvider::new(
             Arc::new(fetcher),
-            Arc::new(RwLock::new(CoinStateCache::new())),
+            Arc::new(RwLock::new(cache)),
             rt.handle().clone(),
             info(),
         );
@@ -313,6 +358,80 @@ mod tests {
         let record = call(move || provider.coin_record(id)).expect("read ok");
         assert!(record.is_some());
         assert_eq!(record.unwrap().confirmed_height, Some(100));
+    }
+
+    /// #1326 regression: a cache-miss live fetch returning a coin created ABOVE the current peak (the
+    /// one-block window before the matching NewPeakWallet lands) must report `confirmed_height`
+    /// clamped to the peak (0 confirmations), NEVER above it — and the coin must stay PRESENT, not
+    /// omitted, since it genuinely exists.
+    #[test]
+    fn live_fetched_coin_above_peak_reports_clamped_confirmed_height() {
+        let c = coin(11);
+        let id = c.coin_id();
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(1_000_001), // above the peak below
+                spent_height: None,
+            }],
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with_peak(fetcher, Some(1_000_000));
+        let record = call(move || provider.coin_record(id))
+            .expect("read ok")
+            .expect("coin present, never omitted");
+        assert_eq!(
+            record.confirmed_height,
+            Some(1_000_000),
+            "an above-peak live coin must clamp to the peak (0 confirmations), never overstate"
+        );
+    }
+
+    /// A live-fetched coin created at/below the peak keeps its real confirmation height (the clamp is
+    /// a no-op on the normal path).
+    #[test]
+    fn live_fetched_coin_at_or_below_peak_is_unaffected() {
+        let c = coin(12);
+        let id = c.coin_id();
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(900_000),
+                spent_height: None,
+            }],
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with_peak(fetcher, Some(1_000_000));
+        let record = call(move || provider.coin_record(id))
+            .expect("read ok")
+            .expect("coin present");
+        assert_eq!(record.confirmed_height, Some(900_000));
+    }
+
+    /// The same clamp holds on the discovery read paths, which are always live (never cache-first).
+    #[test]
+    fn discovery_reads_clamp_above_peak_confirmed_height() {
+        let fetcher = MockFetcher {
+            puzzle_states: vec![CoinState {
+                coin: coin(13),
+                created_height: Some(2_000_000),
+                spent_height: None,
+            }],
+            children: vec![CoinState {
+                coin: coin(14),
+                created_height: Some(2_000_000),
+                spent_height: None,
+            }],
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with_peak(fetcher, Some(1_000_000));
+        let ph = Bytes32::new([8; 32]);
+        let parent = Bytes32::new([9; 32]);
+        let p = provider.clone();
+        let by_ph = call(move || p.coin_records_by_puzzle_hash(ph, true)).unwrap();
+        assert_eq!(by_ph[0].confirmed_height, Some(1_000_000));
+        let by_parent = call(move || provider.coin_records_by_parent(parent)).unwrap();
+        assert_eq!(by_parent[0].confirmed_height, Some(1_000_000));
     }
 
     #[test]

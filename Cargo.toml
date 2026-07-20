@@ -1,6 +1,6 @@
 [package]
 name = "chia-peer"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "DIG Chia light-client connectivity: a wallet-protocol full-node client + ChainSource provider (dig-node seam 1)"
 license = "MIT"

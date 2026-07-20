@@ -108,6 +108,20 @@ Method behaviour:
 `Unsupported` is a first-class fail-closed answer; a composing registry falls through to a source that
 supports these reads. Reporting `Unsupported` is REQUIRED over returning an unreliable value.
 
+**Confirmation-height clamp (all read paths — money-path correctness):** every read that surfaces a
+coin's `created_height` as `confirmed_height` (`coin_record`, `coin_records_by_puzzle_hash`,
+`coin_records_by_parent`) MUST report `confirmed_height ≤ peak_height`. The cache path upholds this
+structurally (§4 invariant), but the cache-MISS *live-fetch* path returns the peer's `created_height`
+directly, which — for an unsubscribed coin created in the current tip block, read in the one-block
+window before the drive loop processes the matching `NewPeakWallet` — could exceed the drive-loop-lagged
+peak and underflow a consumer's `peak_height - confirmed_height` (u32) count into a spurious
+hyper-confirmed value. The provider therefore clamps the reported `confirmed_height` to
+`min(created_height, peak_height)`: an above-peak coin reports 0 confirmations (the conservative,
+understating direction) and remains PRESENT (never omitted — the coin genuinely exists). The peak is
+never inflated from a fetched coin (a lying peer must not raise it). When no peak is known yet
+(`peak_height` is `None`), no `peak - confirmed` subtraction is possible and the height is left as
+reported.
+
 ### Provider descriptor
 
 `provider_info` reports `ProviderKind::LocalNode` when pointed at the operator's own trusted node,
