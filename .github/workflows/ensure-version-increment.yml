@@ -16,6 +16,10 @@ concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
   cancel-in-progress: true
 
+# Least-privilege default (GHAS): the version check only reads the two checkouts.
+permissions:
+  contents: read
+
 jobs:
   check-version:
     name: Check version increment

@@ -41,6 +41,14 @@ is reserved for a peer that RELIABLY reported the thing does not exist. `resolve
 `block_timestamp` are reported `Unsupported` (a first-class fail-closed answer) rather than answered
 unreliably from subscription state — a composing registry falls through to a source that supports them.
 
+## Known advisory: RUSTSEC-2023-0071 (rsa Marvin timing side-channel)
+
+`rsa 0.9.10` (transitive via `chia-ssl 0.26` → TLS cert handling) carries RUSTSEC-2023-0071 (a
+Marvin timing side-channel). There is NO upstream fix available, it is IDENTICAL under chia-wallet-sdk
+0.34, and it is ecosystem-wide (every crate on this SDK stack). It is not exploitable in this crate's
+usage (ephemeral self-signed client-cert generation, no RSA decryption of attacker-chosen ciphertext).
+No crate-level fix here; tracked as an ecosystem follow-up when an upstream `rsa` fix lands.
+
 ## Sync facade needs a multi-thread runtime
 
 The `ChainSource` trait is synchronous + object-safe; the provider bridges to the async client with a

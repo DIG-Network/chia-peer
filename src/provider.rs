@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use chia_protocol::{Bytes32, CoinSpend, CoinState, CoinStateFilters};
+use chia_protocol::{Bytes32, CoinSpend, CoinState, CoinStateFilters, Program};
 use dig_chainsource_interface::{
     ChainSource, ChainSourceError, ChainSourceProvider, CoinRecord, ProviderInfo, SingletonLineage,
 };
@@ -133,11 +133,15 @@ impl ChainSource for ChiaPeerProvider {
             return Ok(None);
         };
         let fetcher = self.fetcher.clone();
-        let reveal = run_blocking(&self.handle, async move {
+        let (puzzle, solution) = run_blocking(&self.handle, async move {
             fetcher.puzzle_and_solution(coin_id, spent_height).await
         })?
         .map_err(ChainSourceError::from)?;
-        Ok(reveal.map(|(puzzle, solution)| CoinSpend::new(state.coin, puzzle, solution)))
+
+        // Defend against a lying peer: the reveal MUST hash to the coin's own puzzle hash, else the
+        // spend is not this coin's. Fail closed on a mismatch or an unparseable reveal.
+        verify_reveal_matches(&puzzle, state.coin.puzzle_hash)?;
+        Ok(Some(CoinSpend::new(state.coin, puzzle, solution)))
     }
 
     fn resolve_singleton_lineage(
@@ -167,6 +171,20 @@ impl ChainSourceProvider for ChiaPeerProvider {
     fn provider_info(&self) -> ProviderInfo {
         self.info.clone()
     }
+}
+
+/// Verifies a puzzle reveal hashes to `expected` (the coin's own puzzle hash), failing closed on a
+/// mismatch or an unparseable reveal. A lying peer cannot pass off a wrong reveal as this coin's.
+fn verify_reveal_matches(puzzle: &Program, expected: Bytes32) -> Result<(), ChainSourceError> {
+    let actual: Bytes32 = chia::clvm_utils::tree_hash_from_bytes(puzzle.as_ref())
+        .map_err(|e| ChainSourceError::Malformed(format!("undecodable puzzle reveal: {e}")))?
+        .into();
+    if actual != expected {
+        return Err(ChainSourceError::Malformed(
+            "puzzle reveal does not hash to the coin's puzzle hash".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -222,12 +240,26 @@ mod tests {
             &self,
             _coin_id: Bytes32,
             _height: u32,
-        ) -> Result<Option<(Program, Program)>, ChiaPeerError> {
-            match &self.fail {
-                Some(e) => Err(e.clone()),
-                None => Ok(self.reveal.clone()),
+        ) -> Result<(Program, Program), ChiaPeerError> {
+            if let Some(e) = &self.fail {
+                return Err(e.clone());
+            }
+            match &self.reveal {
+                Some(reveal) => Ok(reveal.clone()),
+                // Absence is impossible on this path (caller confirmed spent) → fail closed.
+                None => Err(ChiaPeerError::Rejected("no reveal".into())),
             }
         }
+    }
+
+    /// A puzzle reveal and the coin puzzle hash it hashes to, so `coin_spend`'s reveal verification
+    /// passes for a legitimately-served spend.
+    fn reveal_and_matching_puzzle_hash() -> (Program, Bytes32) {
+        let puzzle = Program::from(vec![1u8]);
+        let ph: Bytes32 = chia::clvm_utils::tree_hash_from_bytes(puzzle.as_ref())
+            .unwrap()
+            .into();
+        (puzzle, ph)
     }
 
     fn info() -> ProviderInfo {
@@ -324,7 +356,53 @@ mod tests {
 
     #[test]
     fn coin_spend_of_spent_coin_assembles_from_real_coin() {
-        let c = coin(5);
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let c = Coin::new(Bytes32::new([5; 32]), ph, 1);
+        let id = c.coin_id();
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(10),
+                spent_height: Some(20),
+            }],
+            reveal: Some((puzzle, Program::from(vec![2u8]))),
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with(fetcher);
+        let spend = call(move || provider.coin_spend(id))
+            .unwrap()
+            .expect("spend");
+        assert_eq!(spend.coin, c);
+    }
+
+    /// Fix 3 regression: a KNOWN-SPENT coin whose reveal the peer rejects must fail closed with
+    /// `Err` — NEVER `Ok(None)` (which would corrupt the interface's parent-walk authentication).
+    #[test]
+    fn coin_spend_of_spent_coin_with_rejected_reveal_is_err_never_none() {
+        let c = coin(6);
+        let id = c.coin_id();
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(10),
+                spent_height: Some(20),
+            }],
+            reveal: None, // peer rejects / has no reveal
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with(fetcher);
+        let result = call(move || provider.coin_spend(id));
+        assert!(
+            matches!(result, Err(ChainSourceError::Transport(_))),
+            "a rejected reveal for a spent coin must be Err, never Ok(None): {result:?}"
+        );
+    }
+
+    /// Fix 4 regression: a reveal that does NOT hash to the coin's puzzle hash (a lying peer) is
+    /// rejected as malformed, never assembled into a bogus spend.
+    #[test]
+    fn coin_spend_rejects_a_reveal_that_does_not_hash_to_the_coin() {
+        let c = coin(8); // puzzle_hash is [8^1;32], which the reveal below will NOT hash to
         let id = c.coin_id();
         let fetcher = MockFetcher {
             coin_states: vec![CoinState {
@@ -336,10 +414,11 @@ mod tests {
             ..Default::default()
         };
         let (_rt, provider) = provider_with(fetcher);
-        let spend = call(move || provider.coin_spend(id))
-            .unwrap()
-            .expect("spend");
-        assert_eq!(spend.coin, c);
+        let result = call(move || provider.coin_spend(id));
+        assert!(
+            matches!(result, Err(ChainSourceError::Malformed(_))),
+            "a mismatched reveal must be Malformed: {result:?}"
+        );
     }
 
     #[test]

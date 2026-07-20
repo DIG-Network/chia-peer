@@ -16,6 +16,14 @@ use tokio::sync::RwLock;
 
 use crate::error::ChiaPeerError;
 
+/// Max pages an UNTRUSTED peer may return for one paged puzzle-state read before we fail closed.
+/// Bounds a hostile peer that never sets `is_finished` (would otherwise hang + OOM).
+const MAX_PUZZLE_STATE_PAGES: usize = 10_000;
+
+/// Max coin states accumulated across a single paged read before we fail closed. Bounds unbounded
+/// memory growth from a peer that streams coins forever.
+const MAX_ACCUMULATED_COIN_STATES: usize = 500_000;
+
 /// The reads a provider issues against a Chia full node when its local cache misses.
 ///
 /// `subscribe = true` arms a server-side subscription so future changes stream back as
@@ -41,14 +49,16 @@ pub trait CoinStateFetcher: Send + Sync {
     /// Reads the direct children created by spending `coin_id`.
     async fn children(&self, coin_id: Bytes32) -> Result<Vec<CoinState>, ChiaPeerError>;
 
-    /// Reads the puzzle reveal + solution of the coin spent at `height`, if available.
+    /// Reads the puzzle reveal + solution of the coin spent at `height`.
     ///
-    /// `Ok(None)` = the peer has no such spend record; `Err(_)` = could not answer.
+    /// Callers reach this ONLY after confirming the coin is spent, so absence is impossible: a
+    /// rejection/absence is a "could not answer" and is returned as `Err(_)` (fail closed), NEVER a
+    /// misleading `Ok(None)` that would corrupt the interface's parent-walk authentication.
     async fn puzzle_and_solution(
         &self,
         coin_id: Bytes32,
         height: u32,
-    ) -> Result<Option<(Program, Program)>, ChiaPeerError>;
+    ) -> Result<(Program, Program), ChiaPeerError>;
 }
 
 /// A [`CoinStateFetcher`] backed by a live wallet-protocol [`Peer`].
@@ -131,6 +141,56 @@ impl PeerFetcher {
     }
 }
 
+/// One page of a paged `request_puzzle_state` read.
+struct PuzzleStatePage {
+    coin_states: Vec<CoinState>,
+    height: u32,
+    header_hash: Bytes32,
+    is_finished: bool,
+}
+
+/// Drives a paged puzzle-state read to completion, bounding an UNTRUSTED peer three ways so it can
+/// neither hang the caller nor exhaust memory: a page cap, a total accumulated-coin cap, and a
+/// strict-progress requirement (each unfinished page MUST advance `height`). Any violation fails
+/// closed with `Err`, never an unbounded loop.
+///
+/// The page fetch is injected so the bounding policy is unit-testable without a live peer.
+async fn collect_paged<F, Fut>(
+    genesis_challenge: Bytes32,
+    mut fetch_page: F,
+) -> Result<Vec<CoinState>, ChiaPeerError>
+where
+    F: FnMut(Option<u32>, Bytes32) -> Fut,
+    Fut: std::future::Future<Output = Result<PuzzleStatePage, ChiaPeerError>>,
+{
+    let mut all = Vec::new();
+    let mut previous_height: Option<u32> = None;
+    let mut header_hash = genesis_challenge;
+
+    for _page in 0..MAX_PUZZLE_STATE_PAGES {
+        let page = fetch_page(previous_height, header_hash).await?;
+        all.extend(page.coin_states);
+        if all.len() > MAX_ACCUMULATED_COIN_STATES {
+            return Err(ChiaPeerError::Rejected(format!(
+                "puzzle-state response exceeded {MAX_ACCUMULATED_COIN_STATES} coins"
+            )));
+        }
+        if page.is_finished {
+            return Ok(all);
+        }
+        if previous_height.is_some_and(|prev| page.height <= prev) {
+            return Err(ChiaPeerError::Rejected(
+                "puzzle-state paging did not advance the height".into(),
+            ));
+        }
+        previous_height = Some(page.height);
+        header_hash = page.header_hash;
+    }
+    Err(ChiaPeerError::Rejected(format!(
+        "puzzle-state paging exceeded {MAX_PUZZLE_STATE_PAGES} pages"
+    )))
+}
+
 #[async_trait]
 impl CoinStateFetcher for PeerFetcher {
     async fn coin_states(
@@ -159,32 +219,33 @@ impl CoinStateFetcher for PeerFetcher {
         subscribe: bool,
     ) -> Result<Vec<CoinState>, ChiaPeerError> {
         let peer = self.peer().await?;
-        let mut all = Vec::new();
-        let mut previous_height: Option<u32> = None;
-        let mut header_hash = self.genesis_challenge;
-
-        loop {
-            // Subscribe only once the final page arrives, so a single subscription covers the set.
-            let response = self
-                .with_timeout(peer.request_puzzle_state(
-                    puzzle_hashes.clone(),
-                    previous_height,
-                    header_hash,
-                    filters.clone(),
-                    subscribe,
-                ))
-                .await?
-                .map_err(|e| ChiaPeerError::Transport(e.to_string()))?
-                .map_err(|_| ChiaPeerError::Rejected("puzzle-state request rejected".into()))?;
-
-            all.extend(response.coin_states.iter().cloned());
-            if response.is_finished {
-                break;
+        // Subscribe only once the final page arrives, so a single subscription covers the set.
+        collect_paged(self.genesis_challenge, |previous_height, header_hash| {
+            let peer = peer.clone();
+            let puzzle_hashes = puzzle_hashes.clone();
+            let filters = filters.clone();
+            let this = self;
+            async move {
+                let response = this
+                    .with_timeout(peer.request_puzzle_state(
+                        puzzle_hashes,
+                        previous_height,
+                        header_hash,
+                        filters,
+                        subscribe,
+                    ))
+                    .await?
+                    .map_err(|e| ChiaPeerError::Transport(e.to_string()))?
+                    .map_err(|_| ChiaPeerError::Rejected("puzzle-state request rejected".into()))?;
+                Ok(PuzzleStatePage {
+                    coin_states: response.coin_states,
+                    height: response.height,
+                    header_hash: response.header_hash,
+                    is_finished: response.is_finished,
+                })
             }
-            previous_height = Some(response.height);
-            header_hash = response.header_hash;
-        }
-        Ok(all)
+        })
+        .await
     }
 
     async fn children(&self, coin_id: Bytes32) -> Result<Vec<CoinState>, ChiaPeerError> {
@@ -200,17 +261,20 @@ impl CoinStateFetcher for PeerFetcher {
         &self,
         coin_id: Bytes32,
         height: u32,
-    ) -> Result<Option<(Program, Program)>, ChiaPeerError> {
+    ) -> Result<(Program, Program), ChiaPeerError> {
         let peer = self.peer().await?;
         let outcome = self
             .with_timeout(peer.request_puzzle_and_solution(coin_id, height))
             .await?
             .map_err(|e| ChiaPeerError::Transport(e.to_string()))?;
         match outcome {
-            Ok(response) => Ok(Some((response.puzzle, response.solution))),
-            // A rejection here means the peer has no puzzle/solution for that (coin, height) — a
-            // genuine absence for this read path.
-            Err(_) => Ok(None),
+            Ok(response) => Ok((response.puzzle, response.solution)),
+            // The caller only asks after confirming a spent height, so a reject here is NOT a
+            // genuine absence — it is a peer that could not/would not answer. Fail closed with Err,
+            // never a misleading Ok(None) (mirrors how coin-state rejects map to Err(Rejected)).
+            Err(_) => Err(ChiaPeerError::Rejected(
+                "peer rejected puzzle/solution for a known-spent coin".into(),
+            )),
         }
     }
 }
@@ -290,11 +354,11 @@ mod tests {
     async fn puzzle_and_solution_of_unspent_coin_never_yields_a_spend() {
         let (_sim, fetcher, coin) = fetcher_over_sim().await;
         let result = fetcher.puzzle_and_solution(coin.coin_id(), 1).await;
-        // An unspent coin has no reveal: the node either reports absence (`Ok(None)`) or fails to
-        // answer (`Err`). It must NEVER fabricate a spend (`Ok(Some(_))`).
+        // An unspent coin has no reveal. Fail closed with `Err` — NEVER fabricate a spend, and never
+        // a misleading `Ok` (the caller only asks after confirming a spent height).
         assert!(
-            !matches!(result, Ok(Some(_))),
-            "unspent coin must not yield a reveal: {result:?}"
+            result.is_err(),
+            "unspent coin must fail closed, not yield a reveal: {result:?}"
         );
     }
 
@@ -317,6 +381,76 @@ mod tests {
             .remove_coin_subscriptions(vec![coin.coin_id()])
             .await
             .unwrap();
+    }
+
+    fn page(states: usize, height: u32, is_finished: bool) -> PuzzleStatePage {
+        PuzzleStatePage {
+            coin_states: (0..states)
+                .map(|_| CoinState {
+                    coin: Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 1),
+                    created_height: Some(height),
+                    spent_height: None,
+                })
+                .collect(),
+            height,
+            header_hash: Bytes32::new([height as u8; 32]),
+            is_finished,
+        }
+    }
+
+    #[tokio::test]
+    async fn paging_that_never_finishes_fails_closed_not_hangs() {
+        // A hostile peer that always advances height but never sets is_finished must hit the page cap.
+        let mut next_height = 0u32;
+        let result = collect_paged(Bytes32::default(), |_prev, _hdr| {
+            next_height += 1;
+            let h = next_height;
+            async move { Ok(page(1, h, false)) }
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ChiaPeerError::Rejected(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paging_without_progress_fails_closed() {
+        // A peer that returns unfinished pages at a NON-advancing height is rejected immediately.
+        let result = collect_paged(Bytes32::default(), |_prev, _hdr| async move {
+            Ok(page(1, 42, false))
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ChiaPeerError::Rejected(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paging_over_coin_cap_fails_closed() {
+        let result = collect_paged(Bytes32::default(), |_prev, _hdr| async move {
+            Ok(page(MAX_ACCUMULATED_COIN_STATES + 1, 1, false))
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ChiaPeerError::Rejected(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paging_finishes_normally_returns_all() {
+        let mut calls = 0u32;
+        let result = collect_paged(Bytes32::default(), |_prev, _hdr| {
+            calls += 1;
+            let finished = calls == 2;
+            let h = calls;
+            async move { Ok(page(1, h, finished)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 2, "both pages accumulated then finished");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

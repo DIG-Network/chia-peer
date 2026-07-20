@@ -241,13 +241,16 @@ fn spawn_drive_loop(
         while let Some(message) = receiver.recv().await {
             match message.msg_type {
                 ProtocolMessageTypes::NewPeakWallet => {
-                    if let Ok(peak) = NewPeakWallet::from_bytes(&message.data) {
-                        cache.write().await.set_peak(peak.height, peak.header_hash);
+                    match NewPeakWallet::from_bytes(&message.data) {
+                        Ok(peak) => cache.write().await.set_peak(peak.height, peak.header_hash),
+                        // A malformed push is non-fatal (drop it), but log it to aid diagnosis.
+                        Err(error) => log::debug!("undecodable NewPeakWallet push: {error}"),
                     }
                 }
                 ProtocolMessageTypes::CoinStateUpdate => {
-                    if let Ok(update) = CoinStateUpdate::from_bytes(&message.data) {
-                        apply_coin_state_update(&cache, update).await;
+                    match CoinStateUpdate::from_bytes(&message.data) {
+                        Ok(update) => apply_coin_state_update(&cache, update).await,
+                        Err(error) => log::debug!("undecodable CoinStateUpdate push: {error}"),
                     }
                 }
                 _ => {}
