@@ -122,6 +122,19 @@ never inflated from a fetched coin (a lying peer must not raise it). When no pea
 (`peak_height` is `None`), no `peak - confirmed` subtraction is possible and the height is left as
 reported.
 
+**Spend-height clamp (all read paths — money-path correctness):** symmetrically, every read that
+surfaces a coin's `spent_height` (`coin_record`, `coin_records_by_puzzle_hash`, `coin_records_by_parent`)
+MUST report `spent_height ≤ peak_height`. The cache-MISS *live-fetch* path returns the peer's
+`spent_height` directly, which — for a coin spent in the current tip block, read in the one-block window
+before the matching `NewPeakWallet` is processed — could exceed the drive-loop-lagged peak and underflow
+a consumer's `peak_height - spent_height` (u32) spend-depth into a spurious hyper-deep value. The provider
+therefore clamps the reported `spent_height` to `min(spent_height, peak_height)`: an above-peak spent coin
+reports 0 spend-depth (the conservative, understating direction). The clamp bounds only the reported
+HEIGHT — it NEVER changes the spent-vs-unspent flag (`spent_height` stays `Some`, the coin stays marked
+spent), and `coin_spend` decides spentness from the raw peer state (not the clamped record), so its
+behaviour is unaffected. When no peak is known yet (`peak_height` is `None`), the height is left as
+reported.
+
 ### Provider descriptor
 
 `provider_info` reports `ProviderKind::LocalNode` when pointed at the operator's own trusted node,
