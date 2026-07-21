@@ -85,7 +85,7 @@ impl ChainSource for ChiaPeerProvider {
         Ok(self
             .coin_state(coin_id)?
             .map(CoinRecord::from_coin_state)
-            .map(|record| clamp_confirmed_to_peak(record, peak)))
+            .map(|record| clamp_record_heights_to_peak(record, peak)))
     }
 
     fn coin_records_by_puzzle_hash(
@@ -110,7 +110,7 @@ impl ChainSource for ChiaPeerProvider {
         Ok(states
             .into_iter()
             .map(CoinRecord::from_coin_state)
-            .map(|record| clamp_confirmed_to_peak(record, peak))
+            .map(|record| clamp_record_heights_to_peak(record, peak))
             .collect())
     }
 
@@ -127,7 +127,7 @@ impl ChainSource for ChiaPeerProvider {
         Ok(states
             .into_iter()
             .map(CoinRecord::from_coin_state)
-            .map(|record| clamp_confirmed_to_peak(record, peak))
+            .map(|record| clamp_record_heights_to_peak(record, peak))
             .collect())
     }
 
@@ -181,26 +181,30 @@ impl ChainSourceProvider for ChiaPeerProvider {
     }
 }
 
-/// Bounds a record's reported `confirmed_height` by the current known peak.
+/// Bounds a record's reported block heights (`confirmed_height` and `spent_height`) by the current
+/// known peak.
 ///
-/// The cache read path already upholds "no coin has `created_height > peak_height`" structurally
-/// (see [`CoinStateCache`](crate::cache::CoinStateCache)), but the cache-MISS *live-fetch* path
-/// surfaces the peer's `created_height` directly. An unsubscribed coin created in the current tip
-/// block — read in the one-block window before the drive loop processes the matching
-/// `NewPeakWallet` — would otherwise report `confirmed_height > peak_height`, underflowing a
-/// consumer's `peak_height - confirmed_height` (u32) confirmation count into a spurious ~4.29-billion
+/// The cache read path already upholds "no coin has a height `> peak_height`" structurally (see
+/// [`CoinStateCache`](crate::cache::CoinStateCache)), but the cache-MISS *live-fetch* path surfaces
+/// the peer's heights directly. A coin created or spent in the current tip block — read in the
+/// one-block window before the drive loop processes the matching `NewPeakWallet` — would otherwise
+/// report a height `> peak_height`, underflowing a consumer's `peak_height - height` (u32) depth count
+/// (confirmations for `confirmed_height`, spend-depth for `spent_height`) into a spurious ~4.29-billion
 /// value on a money path.
 ///
-/// Clamping to `min(created, peak)` makes such a coin report 0 confirmations — the conservative,
-/// understating direction — while keeping it PRESENT (never omitted): the coin genuinely exists, so a
-/// false absence would be worse. The peak is left untouched (a lying peer must not be able to inflate
-/// it via a fetched coin). When no peak is known yet, `peak_height` is also `None`, so no
-/// `peak - confirmed` subtraction is possible and the height is left as reported.
-fn clamp_confirmed_to_peak(mut record: CoinRecord, peak: Option<u32>) -> CoinRecord {
-    if let (Some(confirmed), Some(peak)) = (record.confirmed_height, peak) {
-        if confirmed > peak {
-            record.confirmed_height = Some(peak);
-        }
+/// Clamping each height to `min(height, peak)` makes such a coin report 0 confirmations / 0 spend-depth
+/// — the conservative, understating direction — while keeping it PRESENT (never omitted) and keeping
+/// `spent_height` `Some` (the coin IS spent; only the reported HEIGHT is clamped, never the
+/// spent-vs-unspent flag). The peak is left untouched (a lying peer must not be able to inflate it via
+/// a fetched coin). When no peak is known yet, `peak_height` is `None`, so no `peak - height`
+/// subtraction is possible and the heights are left as reported.
+fn clamp_record_heights_to_peak(mut record: CoinRecord, peak: Option<u32>) -> CoinRecord {
+    let Some(peak) = peak else { return record };
+    if let Some(confirmed) = record.confirmed_height {
+        record.confirmed_height = Some(confirmed.min(peak));
+    }
+    if let Some(spent) = record.spent_height {
+        record.spent_height = Some(spent.min(peak));
     }
     record
 }
@@ -415,12 +419,12 @@ mod tests {
             puzzle_states: vec![CoinState {
                 coin: coin(13),
                 created_height: Some(2_000_000),
-                spent_height: None,
+                spent_height: Some(2_000_000),
             }],
             children: vec![CoinState {
                 coin: coin(14),
                 created_height: Some(2_000_000),
-                spent_height: None,
+                spent_height: Some(2_000_000),
             }],
             ..Default::default()
         };
@@ -430,8 +434,86 @@ mod tests {
         let p = provider.clone();
         let by_ph = call(move || p.coin_records_by_puzzle_hash(ph, true)).unwrap();
         assert_eq!(by_ph[0].confirmed_height, Some(1_000_000));
+        assert_eq!(by_ph[0].spent_height, Some(1_000_000));
         let by_parent = call(move || provider.coin_records_by_parent(parent)).unwrap();
         assert_eq!(by_parent[0].confirmed_height, Some(1_000_000));
+        assert_eq!(by_parent[0].spent_height, Some(1_000_000));
+    }
+
+    /// #1346 regression (symmetric to #1326): a cache-miss live fetch returning a coin SPENT above
+    /// the current peak (the one-block window before the matching NewPeakWallet lands) must report
+    /// `spent_height` clamped to the peak (0 spend-depth), NEVER above it — closing the identical
+    /// `peak_height - spent_height` (u32) underflow. The coin stays PRESENT and stays marked SPENT
+    /// (`spent_height` remains `Some`); only the reported height is clamped.
+    #[test]
+    fn live_fetched_coin_spent_above_peak_reports_clamped_spent_height() {
+        let c = coin(15);
+        let id = c.coin_id();
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(999_999),
+                spent_height: Some(1_000_001), // spent above the peak below
+            }],
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with_peak(fetcher, Some(1_000_000));
+        let record = call(move || provider.coin_record(id))
+            .expect("read ok")
+            .expect("coin present, never omitted");
+        assert_eq!(
+            record.spent_height,
+            Some(1_000_000),
+            "an above-peak spent coin must clamp spent_height to the peak (0 spend-depth), never overstate"
+        );
+        assert!(
+            record.is_spent(),
+            "the coin IS spent — clamping the reported height must never drop the spent flag"
+        );
+    }
+
+    /// A live-fetched coin spent at/below the peak keeps its real spend height (the clamp is a no-op
+    /// on the normal path).
+    #[test]
+    fn live_fetched_coin_spent_at_or_below_peak_is_unaffected() {
+        let c = coin(16);
+        let id = c.coin_id();
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(800_000),
+                spent_height: Some(900_000),
+            }],
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with_peak(fetcher, Some(1_000_000));
+        let record = call(move || provider.coin_record(id))
+            .expect("read ok")
+            .expect("coin present");
+        assert_eq!(record.spent_height, Some(900_000));
+    }
+
+    /// The clamp must not flip a spent coin to unspent: `coin_spend` keys spentness on the RAW peer
+    /// state (not the clamped record), so a coin spent above the lagged peak still assembles its spend.
+    #[test]
+    fn coin_spend_of_coin_spent_above_peak_still_identified_as_spent() {
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let c = Coin::new(Bytes32::new([17; 32]), ph, 1);
+        let id = c.coin_id();
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(999_999),
+                spent_height: Some(1_000_001), // above the peak
+            }],
+            reveal: Some((puzzle, Program::from(vec![2u8]))),
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_with_peak(fetcher, Some(1_000_000));
+        let spend = call(move || provider.coin_spend(id))
+            .unwrap()
+            .expect("a coin spent above the lagged peak is still spent");
+        assert_eq!(spend.coin, c);
     }
 
     #[test]
