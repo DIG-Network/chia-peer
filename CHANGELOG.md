@@ -4,10 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.1.3] - 2026-07-20
+## [0.1.3] - 2026-07-21
 
 ### Bug Fixes
-- Clamp live-fetched spent_height to peak (#1346), symmetric to the confirmed_height clamp (#1326)
+- Clamp live-fetched spent_height to peak (#1346) (#4)
 
 ## [0.1.2] - 2026-07-20
 
