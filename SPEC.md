@@ -28,10 +28,18 @@ chia-peer is one subscribing light-client provider that a registry composes alon
 
 ## 2. Version pairing (normative)
 
-chia-peer depends on `chia-wallet-sdk = 0.30`, `chia = 0.26`, `chia-protocol = 0.26`. This pairing is
-REQUIRED: `dig-chainsource-interface` speaks `chia-protocol 0.26`, and a newer wallet-sdk pulls a newer
-`chia-protocol` whose `Coin`/`CoinSpend`/`Bytes32` types would NOT unify with the interface the
-provider implements. A single `chia-protocol` version across the read interface is an invariant.
+chia-peer depends on `dig-chainsource-interface = 0.3`, `chia-protocol = 0.36.1`, and
+`chia-wallet-sdk = 0.34`. This pairing is REQUIRED: `dig-chainsource-interface 0.3` speaks
+`chia-protocol 0.36.1`, and a wallet-sdk on any other `chia-protocol` line yields
+`Coin`/`CoinSpend`/`Bytes32` types that would NOT unify with the interface the provider implements.
+**A single `chia-protocol` version across the read interface is an invariant**; the SDK version is
+chosen to match the interface's `chia-protocol`, never the other way around.
+
+chia-peer MUST NOT depend on the `chia` umbrella crate. The umbrella has no release on the
+`chia-protocol 0.36` line (crates.io jumps 0.32.0 to 0.42.0), so it cannot satisfy the invariant
+above. The four umbrella modules this crate needs are taken from the SDK's re-exports —
+`chia_wallet_sdk::chia::{bls, ssl, traits}` and `chia_wallet_sdk::clvm_utils` — which are by
+construction the same types the SDK's own `Peer`/`connect_peer` signatures expect.
 
 ## 3. Connection model
 

@@ -8,11 +8,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use chia::traits::Streamable;
 use chia_protocol::{
     Bytes32, CoinStateFilters, CoinStateUpdate, Message, NewPeakWallet, ProtocolMessageTypes,
     SpendBundle,
 };
+use chia_wallet_sdk::chia::traits::Streamable;
 use dig_chainsource_interface::{ProviderId, ProviderInfo, ProviderKind};
 use std::borrow::Cow;
 use tokio::sync::{mpsc, RwLock};
@@ -335,6 +335,7 @@ mod tests {
 mod simulator_tests {
     use super::*;
     use chia_protocol::SpendBundle;
+    use chia_wallet_sdk::chia::bls::Signature;
     use chia_wallet_sdk::test::PeerSimulator;
     use dig_chainsource_interface::ChainSource;
     use std::time::Duration;
@@ -386,7 +387,7 @@ mod simulator_tests {
     async fn submit_invalid_bundle_reports_failure() {
         let (_sim, client, _coin) = client_over_sim().await;
         let outcome = client
-            .submit_spend(SpendBundle::new(vec![], chia::bls::Signature::default()))
+            .submit_spend(SpendBundle::new(vec![], Signature::default()))
             .await
             .unwrap();
         assert_eq!(outcome, SubmitOutcome::Failed);

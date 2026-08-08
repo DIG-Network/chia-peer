@@ -284,6 +284,7 @@ mod tests {
     use super::*;
     use crate::config::ChiaNetwork;
     use chia_protocol::{Coin, SpendBundle};
+    use chia_wallet_sdk::chia::bls::Signature;
     use chia_wallet_sdk::test::PeerSimulator;
     use std::time::Duration;
 
@@ -365,7 +366,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submitting_an_invalid_bundle_returns_a_failure_ack() {
         let (_sim, fetcher, _coin) = fetcher_over_sim().await;
-        let bundle = SpendBundle::new(vec![], chia::bls::Signature::default());
+        let bundle = SpendBundle::new(vec![], Signature::default());
         let status = fetcher.send_transaction(bundle).await.unwrap();
         assert_eq!(status, 3, "an empty bundle is rejected with a failure ack");
     }
@@ -482,7 +483,7 @@ mod tests {
         );
         assert_eq!(
             fetcher
-                .send_transaction(SpendBundle::new(vec![], chia::bls::Signature::default()))
+                .send_transaction(SpendBundle::new(vec![], Signature::default()))
                 .await,
             Err(ChiaPeerError::NotConnected)
         );
