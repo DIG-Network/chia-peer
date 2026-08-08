@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.2.0] - 2026-08-08
+
+### Features
+- Bump dig-chainsource-interface 0.1 -> 0.3 and move onto the chia-protocol 0.36.1 line (#5)
+
 ## [0.1.3] - 2026-07-21
 
 ### Bug Fixes
