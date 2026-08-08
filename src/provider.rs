@@ -212,7 +212,7 @@ fn clamp_record_heights_to_peak(mut record: CoinRecord, peak: Option<u32>) -> Co
 /// Verifies a puzzle reveal hashes to `expected` (the coin's own puzzle hash), failing closed on a
 /// mismatch or an unparseable reveal. A lying peer cannot pass off a wrong reveal as this coin's.
 fn verify_reveal_matches(puzzle: &Program, expected: Bytes32) -> Result<(), ChainSourceError> {
-    let actual: Bytes32 = chia::clvm_utils::tree_hash_from_bytes(puzzle.as_ref())
+    let actual: Bytes32 = chia_wallet_sdk::clvm_utils::tree_hash_from_bytes(puzzle.as_ref())
         .map_err(|e| ChainSourceError::Malformed(format!("undecodable puzzle reveal: {e}")))?
         .into();
     if actual != expected {
@@ -292,7 +292,7 @@ mod tests {
     /// passes for a legitimately-served spend.
     fn reveal_and_matching_puzzle_hash() -> (Program, Bytes32) {
         let puzzle = Program::from(vec![1u8]);
-        let ph: Bytes32 = chia::clvm_utils::tree_hash_from_bytes(puzzle.as_ref())
+        let ph: Bytes32 = chia_wallet_sdk::clvm_utils::tree_hash_from_bytes(puzzle.as_ref())
             .unwrap()
             .into();
         (puzzle, ph)

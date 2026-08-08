@@ -27,9 +27,11 @@
 //!
 //! ## The SDK version pairing
 //!
-//! This crate pins `chia-wallet-sdk = 0.30`, which shares `chia-protocol = 0.26` with
-//! `dig-chainsource-interface`. That single `chia-protocol` version is REQUIRED: a newer SDK pulls a
-//! newer `chia-protocol` whose types would not unify with the interface the provider implements.
+//! This crate pins `chia-wallet-sdk = 0.34`, which shares `chia-protocol = 0.36.1` with
+//! `dig-chainsource-interface = 0.3`. That single `chia-protocol` version is REQUIRED: an SDK on a
+//! different `chia-protocol` line yields `Coin`/`CoinSpend`/`Bytes32` types that would not unify
+//! with the interface the provider implements. The SDK version is chosen to MATCH the interface's
+//! `chia-protocol`, never the other way around.
 
 mod bridge;
 mod cache;

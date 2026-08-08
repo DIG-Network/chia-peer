@@ -2,15 +2,39 @@
 
 Durable realizations from building this crate. Context, not a change diary.
 
-## SDK version pairing is load-bearing (0.30, not 0.34)
+## SDK version pairing is load-bearing, and the INTERFACE picks the line
 
-`chia-wallet-sdk = 0.34` internally depends on `chia-protocol 0.36`, while `dig-chainsource-interface`
-(the `ChainSource` trait this crate implements) speaks `chia-protocol 0.26`. Mixing them puts TWO
-incompatible `chia-protocol` versions in the graph — the SDK's `Peer` returns `chia_protocol@0.36`
-`CoinState`/`Coin`, which will not unify with the `chia_protocol@0.26` types the interface exposes, so
-the provider cannot be implemented. `chia-wallet-sdk = 0.30` shares `chia-protocol 0.26` with the
-interface (the same pairing chia-query uses). RULE: keep a single `chia-protocol` version across the
-read interface; the SDK version is chosen to match it, not the other way around.
+The `ChainSource` trait this crate implements exchanges `chia_protocol` types, so the SDK's
+`chia-protocol` and the interface's `chia-protocol` MUST be the same version — otherwise the SDK's
+`Peer` returns a `CoinState`/`Coin` that will not unify with the one the interface exposes and the
+provider simply cannot be implemented.
+
+The RULE, which survives every future bump: **`dig-chainsource-interface` picks the `chia-protocol`
+line; the SDK version is then chosen to match it, never the other way around.** Concretely, the
+crate moved `dig-chainsource-interface 0.1 -> 0.3`, whose only source change is one additive
+`ChainSourceError::TooManyRecords` variant — but whose manifest moved `chia-protocol 0.26 -> 0.36.1`,
+which is what forced `chia-wallet-sdk 0.30 -> 0.34` (0.31/0.32 are unusable here: they pin the
+`chia` umbrella, not `chia-protocol 0.36.1`).
+
+### There is no `chia` umbrella on the 0.36 line — use the SDK's re-exports
+
+The umbrella `chia` crate goes 0.32.0 straight to 0.42.0 on crates.io, so nothing it publishes can
+be held at `chia-protocol 0.36.1`. Depending on it at all would re-introduce the two-version split
+the rule above exists to prevent. Take the pieces from the SDK instead:
+`chia_wallet_sdk::chia::{bls, ssl, traits}` and `chia_wallet_sdk::clvm_utils` (note `clvm_utils` is
+re-exported at the SDK root, *not* under `chia::`). These are by construction the same types the
+SDK's own `Peer`/`connect_peer`/`load_ssl_cert` signatures expect, which the umbrella never
+guaranteed.
+
+### What actually breaks across 0.26 -> 0.36 (very little)
+
+`chia-sdk-client` 0.30 -> 0.34 is functionally identical — every source diff is edition-2024 import
+reordering; `connect_peer`, `create_native_tls_connector`, `load_ssl_cert`, `Peer`, `PeerOptions`,
+`Network` are unchanged. `PeerSimulator`'s `new`/`connect_raw`/`Deref<Target = Mutex<Simulator>>`
+and `Simulator::{new_coin, insert_coin}` are unchanged too. The one real signature change on this
+crate's surface: `clvm_utils::tree_hash_from_bytes` returns `Result<TreeHash, clvmr::EvalErr>`
+instead of `io::Result<TreeHash>` — `EvalErr` is a `thiserror` enum, so `Display`/`Debug` call sites
+compile untouched.
 
 ## The SDK `Peer` is a concrete struct → test behind a seam
 

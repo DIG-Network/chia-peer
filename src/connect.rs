@@ -8,8 +8,8 @@
 
 use std::net::SocketAddr;
 
-use chia::ssl::ChiaCertificate;
 use chia_protocol::Message;
+use chia_wallet_sdk::chia::ssl::ChiaCertificate;
 use chia_wallet_sdk::client::{
     connect_peer, create_native_tls_connector, load_ssl_cert, Network, Peer, PeerOptions,
 };
