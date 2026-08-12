@@ -88,3 +88,4 @@ The `ChainSource` trait is synchronous + object-safe; the provider bridges to th
 `block_in_place`/`block_on` helper that is only sound on a multi-thread tokio runtime and returns a
 clear error (never a panic) on a current-thread runtime. Tests drive the sync facade from a plain
 `std::thread` (the bridge's "outside a runtime" path) to avoid `block_in_place` misuse.
+
