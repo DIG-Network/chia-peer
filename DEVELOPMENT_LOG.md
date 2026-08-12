@@ -61,9 +61,18 @@ error rather than a clean `RejectPuzzleSolution`. Tests assert the safety invari
 ## Fail-closed is the whole point
 
 Every `ChiaPeerError` maps to a `ChainSourceError` `Err`, never `Ok(None)`. Absence (`Ok(None)`/empty)
-is reserved for a peer that RELIABLY reported the thing does not exist. `resolve_singleton_lineage` and
-`block_timestamp` are reported `Unsupported` (a first-class fail-closed answer) rather than answered
-unreliably from subscription state — a composing registry falls through to a source that supports them.
+is reserved for a peer that RELIABLY reported the thing does not exist. `block_timestamp` is reported
+`Unsupported` (a first-class fail-closed answer) rather than answered unreliably — a composing registry
+falls through to a source that indexes timestamps.
+
+`resolve_singleton_lineage` used to be `Unsupported` for the same reason, on the belief that answering
+it from a light source would risk a spoofable, partial lineage. That belief was about *recognising* the
+next coin. The interface's canonical walk (feature `lineage-walk`) **derives** it instead — from the
+current coin's own spend, with the reveal proven against the coin's puzzle hash — so it needs nothing
+but `coin_record` + `coin_spend`, which this provider already answers fail-closed. The refusal was
+therefore obsolete, and the method is now a one-line delegation. The temptation to "help" it along with
+a `coin_records_by_parent` lookup is exactly the hole the walk exists to close: choosing a successor
+from a source-supplied child list hands the source the lineage.
 
 ## Known advisory: RUSTSEC-2023-0071 (rsa Marvin timing side-channel)
 

@@ -110,11 +110,22 @@ Method behaviour:
 | `coin_spend` | resolve the coin (for its real puzzle hash) → if spent, `request_puzzle_and_solution` → `CoinSpend`; unspent/unknown → `Ok(None)` |
 | `parent_spend` | interface default (coin_record + coin_spend) |
 | `peak_height` | tracked peak height, or `Ok(None)` |
-| `resolve_singleton_lineage` | `Err(Unsupported)` — a money-critical forward walk belongs to an aggregating source; a subscription light client MUST NOT answer it partially |
+| `resolve_singleton_lineage` | the interface's canonical `resolve_singleton_lineage_via_walk`, composed from this provider's own `coin_record` + `coin_spend` (see below) |
 | `block_timestamp` | `Err(Unsupported)` — a light source keeps no timestamp index |
 
 `Unsupported` is a first-class fail-closed answer; a composing registry falls through to a source that
-supports these reads. Reporting `Unsupported` is REQUIRED over returning an unreliable value.
+supports the read. Reporting `Unsupported` is REQUIRED over returning an unreliable value.
+
+**Singleton lineage:** `resolve_singleton_lineage` MUST be a one-line delegation to the interface's
+canonical launcher→tip walk (`dig-chainsource-interface`, feature `lineage-walk`). The provider MUST
+NOT add a child-list lookup, a puzzle-hash-equality shortcut, or a cache of lineage results: the walk
+DERIVES each successor from the current coin's own spend — proving the reveal hashes to that coin's
+puzzle hash, running the inner puzzle, and reconstructing the successor's full puzzle hash — and
+deliberately never consults `coin_records_by_parent`, because selecting a successor from a
+source-supplied child list would let the source choose the lineage. Its three-valued discipline is
+this crate's fail-closed contract restated: `Ok(None)` is a proven absence (no such launcher, never
+spent into an eve, or melted), `Ok(Some(_))` is an authenticated lineage, and any failed read is
+`Err(_)` — NEVER collapsed into an absence.
 
 **Confirmation-height clamp (all read paths — money-path correctness):** every read that surfaces a
 coin's `created_height` as `confirmed_height` (`coin_record`, `coin_records_by_puzzle_hash`,

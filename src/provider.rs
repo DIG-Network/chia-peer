@@ -7,22 +7,34 @@
 //! reliably reported absence, while any transport/subscription-gap failure is an `Err` — NEVER a
 //! false `Ok(None)`.
 //!
+//! ## Singleton lineage
+//!
+//! [`resolve_singleton_lineage`](ChainSource::resolve_singleton_lineage) is answered by the
+//! ecosystem's ONE canonical launcher→tip walk,
+//! [`resolve_singleton_lineage_via_walk`], composed purely from this provider's own
+//! [`coin_record`](ChainSource::coin_record) + [`coin_spend`](ChainSource::coin_spend) reads.
+//!
+//! There is nothing spoofable about answering it here, because the walk never *recognises* the next
+//! coin — it **derives** it, by reading the current coin's own spend, proving the reveal hashes to
+//! that coin's puzzle hash, running the inner puzzle, and reconstructing the successor's full puzzle
+//! hash. It deliberately never consults [`coin_records_by_parent`](ChainSource::coin_records_by_parent),
+//! since picking a successor out of a source-supplied child list would let the source steer the
+//! lineage. This crate therefore delegates and adds nothing: no child-list lookup, no puzzle-hash
+//! shortcut, no caching of lineage results.
+//!
 //! ## Boundary
 //!
-//! A subscribing light client is not a full archival index. Two reads are deliberately reported as
-//! [`ChainSourceError::Unsupported`] rather than answered unreliably:
-//! - [`resolve_singleton_lineage`](ChainSource::resolve_singleton_lineage) — a money-critical forward
-//!   walk better served by an aggregating source; answering it from subscription state would risk a
-//!   spoofable, partial lineage.
-//! - [`block_timestamp`](ChainSource::block_timestamp) — a light source keeps no timestamp index.
-//!
-//! The registry composes providers, so these fall through to a source that does support them.
+//! A subscribing light client is not a full archival index. ONE read remains deliberately reported
+//! as [`ChainSourceError::Unsupported`] rather than answered unreliably:
+//! [`block_timestamp`](ChainSource::block_timestamp) — a light source keeps no timestamp index. The
+//! registry composes providers, so it falls through to a source that does index timestamps.
 
 use std::sync::Arc;
 
 use chia_protocol::{Bytes32, CoinSpend, CoinState, CoinStateFilters, Program};
 use dig_chainsource_interface::{
-    ChainSource, ChainSourceError, ChainSourceProvider, CoinRecord, ProviderInfo, SingletonLineage,
+    resolve_singleton_lineage_via_walk, ChainSource, ChainSourceError, ChainSourceProvider,
+    CoinRecord, ProviderInfo, SingletonLineage,
 };
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -152,14 +164,15 @@ impl ChainSource for ChiaPeerProvider {
         Ok(Some(CoinSpend::new(state.coin, puzzle, solution)))
     }
 
+    /// Delegates to the canonical walk, which composes the answer from this provider's own
+    /// `coin_record` + `coin_spend` reads (see the module docs for why derivation, not recognition,
+    /// is the only sound construction). Nothing is added here — a second hand-rolled singleton
+    /// authentication is a byte-drift bug on a money path.
     fn resolve_singleton_lineage(
         &self,
-        _launcher_id: Bytes32,
+        launcher_id: Bytes32,
     ) -> Result<Option<SingletonLineage>, Self::Error> {
-        Err(ChainSourceError::Unsupported(
-            "singleton lineage resolution is not provided by the light-client source; \
-             use an aggregating chain source",
-        ))
+        resolve_singleton_lineage_via_walk(self, launcher_id)
     }
 
     fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
@@ -827,7 +840,9 @@ mod lineage_tests {
             amount: tip.amount,
             inner_solution: inner.solution,
         };
-        let puzzle = layer.construct_puzzle(ctx).expect("the singleton puzzle builds");
+        let puzzle = layer
+            .construct_puzzle(ctx)
+            .expect("the singleton puzzle builds");
         let solution = ctx.alloc(&solution).expect("the solution allocates");
         ctx.spend(tip, Spend::new(puzzle, solution))
             .expect("the singleton spends");
@@ -865,7 +880,9 @@ mod lineage_tests {
         fetcher
     }
 
-    fn provider_over(fetcher: Arc<ChainSnapshotFetcher>) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
+    fn provider_over(
+        fetcher: Arc<ChainSnapshotFetcher>,
+    ) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
