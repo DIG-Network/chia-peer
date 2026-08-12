@@ -7,22 +7,34 @@
 //! reliably reported absence, while any transport/subscription-gap failure is an `Err` — NEVER a
 //! false `Ok(None)`.
 //!
+//! ## Singleton lineage
+//!
+//! [`resolve_singleton_lineage`](ChainSource::resolve_singleton_lineage) is answered by the
+//! ecosystem's ONE canonical launcher→tip walk,
+//! [`resolve_singleton_lineage_via_walk`], composed purely from this provider's own
+//! [`coin_record`](ChainSource::coin_record) + [`coin_spend`](ChainSource::coin_spend) reads.
+//!
+//! There is nothing spoofable about answering it here, because the walk never *recognises* the next
+//! coin — it **derives** it, by reading the current coin's own spend, proving the reveal hashes to
+//! that coin's puzzle hash, running the inner puzzle, and reconstructing the successor's full puzzle
+//! hash. It deliberately never consults [`coin_records_by_parent`](ChainSource::coin_records_by_parent),
+//! since picking a successor out of a source-supplied child list would let the source steer the
+//! lineage. This crate therefore delegates and adds nothing: no child-list lookup, no puzzle-hash
+//! shortcut, no caching of lineage results.
+//!
 //! ## Boundary
 //!
-//! A subscribing light client is not a full archival index. Two reads are deliberately reported as
-//! [`ChainSourceError::Unsupported`] rather than answered unreliably:
-//! - [`resolve_singleton_lineage`](ChainSource::resolve_singleton_lineage) — a money-critical forward
-//!   walk better served by an aggregating source; answering it from subscription state would risk a
-//!   spoofable, partial lineage.
-//! - [`block_timestamp`](ChainSource::block_timestamp) — a light source keeps no timestamp index.
-//!
-//! The registry composes providers, so these fall through to a source that does support them.
+//! A subscribing light client is not a full archival index. ONE read remains deliberately reported
+//! as [`ChainSourceError::Unsupported`] rather than answered unreliably:
+//! [`block_timestamp`](ChainSource::block_timestamp) — a light source keeps no timestamp index. The
+//! registry composes providers, so it falls through to a source that does index timestamps.
 
 use std::sync::Arc;
 
 use chia_protocol::{Bytes32, CoinSpend, CoinState, CoinStateFilters, Program};
 use dig_chainsource_interface::{
-    ChainSource, ChainSourceError, ChainSourceProvider, CoinRecord, ProviderInfo, SingletonLineage,
+    resolve_singleton_lineage_via_walk, ChainSource, ChainSourceError, ChainSourceProvider,
+    CoinRecord, ProviderInfo, SingletonLineage,
 };
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -152,14 +164,15 @@ impl ChainSource for ChiaPeerProvider {
         Ok(Some(CoinSpend::new(state.coin, puzzle, solution)))
     }
 
+    /// Delegates to the canonical walk, which composes the answer from this provider's own
+    /// `coin_record` + `coin_spend` reads (see the module docs for why derivation, not recognition,
+    /// is the only sound construction). Nothing is added here — a second hand-rolled singleton
+    /// authentication is a byte-drift bug on a money path.
     fn resolve_singleton_lineage(
         &self,
-        _launcher_id: Bytes32,
+        launcher_id: Bytes32,
     ) -> Result<Option<SingletonLineage>, Self::Error> {
-        Err(ChainSourceError::Unsupported(
-            "singleton lineage resolution is not provided by the light-client source; \
-             use an aggregating chain source",
-        ))
+        resolve_singleton_lineage_via_walk(self, launcher_id)
     }
 
     fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
@@ -231,6 +244,8 @@ mod tests {
     use chia_protocol::{Coin, Program};
     use dig_chainsource_interface::{ProviderId, ProviderKind};
     use std::borrow::Cow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// A scripted fetcher: each read returns the configured `Ok(..)` states or a forced error, so
     /// the provider's fail-closed mapping can be exercised without a live node.
@@ -241,6 +256,8 @@ mod tests {
         children: Vec<CoinState>,
         puzzle_states: Vec<CoinState>,
         reveal: Option<(Program, Program)>,
+        /// How many `coin_states` reads reached the network — 0 proves a read was served from cache.
+        coin_state_reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -250,6 +267,7 @@ mod tests {
             _coin_ids: Vec<Bytes32>,
             _subscribe: bool,
         ) -> Result<Vec<CoinState>, ChiaPeerError> {
+            self.coin_state_reads.fetch_add(1, Ordering::SeqCst);
             match &self.fail {
                 Some(e) => Err(e.clone()),
                 None => Ok(self.coin_states.clone()),
@@ -317,15 +335,28 @@ mod tests {
         fetcher: MockFetcher,
         peak: Option<u32>,
     ) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
+        let mut cache = CoinStateCache::new();
+        if let Some(height) = peak {
+            cache.set_peak(height, Bytes32::new([0xAB; 32]));
+        }
+        provider_with_cache(fetcher, cache)
+    }
+
+    /// Builds a provider over an ARBITRARY, already-populated cache.
+    ///
+    /// Every other builder starts from an empty cache, which leaves the cache-first branch of
+    /// [`ChiaPeerProvider::coin_state`] unexercised by construction — the exact blind spot that let
+    /// #2792 (a stale cache answering for a spent coin) go unnoticed. Tests that need the cache to
+    /// ANSWER go through here.
+    fn provider_with_cache(
+        fetcher: MockFetcher,
+        cache: CoinStateCache,
+    ) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .expect("multi-thread runtime");
-        let mut cache = CoinStateCache::new();
-        if let Some(height) = peak {
-            cache.set_peak(height, Bytes32::new([0xAB; 32]));
-        }
         let provider = ChiaPeerProvider::new(
             Arc::new(fetcher),
             Arc::new(RwLock::new(cache)),
@@ -655,18 +686,250 @@ mod tests {
         );
     }
 
+    /// `block_timestamp` is the ONE read this source genuinely cannot answer: a light client keeps
+    /// no timestamp index. It reports `Unsupported` rather than a false `Ok(None)`, so a composing
+    /// registry falls through to a source that does index timestamps.
     #[test]
-    fn lineage_and_timestamp_are_unsupported_not_false_absence() {
+    fn timestamp_is_unsupported_not_false_absence() {
         let (_rt, provider) = provider_with(MockFetcher::default());
-        let p = provider.clone();
-        assert!(matches!(
-            call(move || p.resolve_singleton_lineage(Bytes32::new([1; 32]))),
-            Err(ChainSourceError::Unsupported(_))
-        ));
         assert!(matches!(
             call(move || provider.block_timestamp(1)),
             Err(ChainSourceError::Unsupported(_))
         ));
+    }
+
+    // ---- #2792: the cache never answers for state it is no longer receiving updates for ----
+
+    /// A fetcher holding the TRUTH about `coin`: spent at `spent_height`, with a verifiable reveal.
+    fn fetcher_reporting_spent(coin: Coin, spent_height: u32, puzzle: Program) -> MockFetcher {
+        MockFetcher {
+            coin_states: vec![CoinState {
+                coin,
+                created_height: Some(10),
+                spent_height: Some(spent_height),
+            }],
+            reveal: Some((puzzle, Program::from(vec![2u8]))),
+            ..Default::default()
+        }
+    }
+
+    /// Probe (a) — the REORG route to a stranded entry. A coin is cached as spent, then untracked
+    /// (the drive loop drops tracking of spent coins), then a reorg rolls its spend back: the
+    /// rollback loop UN-SPENDS the now-unsubscribed entry, leaving an unspent state no update can
+    /// ever correct. `coin_spend` short-circuits off that same cached `spent_height`, so the lie is
+    /// self-consistent and the real spend is never seen.
+    #[test]
+    fn a_stranded_entry_unspent_by_a_reorg_does_not_hide_the_real_spend() {
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let c = Coin::new(Bytes32::new([21; 32]), ph, 1);
+        let id = c.coin_id();
+
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([id]);
+        cache.seed([CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: Some(150),
+        }]);
+        cache.set_peak(200, Bytes32::new([0xAB; 32]));
+        cache.untrack_coins(&[id]); // spent → the drive loop stops tracking it
+                                    // A reorg forking below the spend un-spends whatever is still cached.
+        cache.apply_update(&[], 160, 100, Bytes32::new([0xCD; 32]));
+
+        let (_rt, provider) = provider_with_cache(fetcher_reporting_spent(c, 150, puzzle), cache);
+        let spend = call(move || provider.coin_spend(id))
+            .expect("read ok")
+            .expect("the real spend must be reported, never masked by a stranded cache entry");
+        assert_eq!(spend.coin, c);
+    }
+
+    /// Probe (b) — the EXPLICIT-UNSUBSCRIBE route. Nothing exotic: the caller unsubscribes, so the
+    /// cache stops receiving updates for the coin. Any state it keeps is frozen at that instant, and
+    /// a coin unspent then may be spent now.
+    #[test]
+    fn an_unsubscribed_coin_is_not_served_from_a_frozen_cache_entry() {
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let c = Coin::new(Bytes32::new([22; 32]), ph, 1);
+        let id = c.coin_id();
+
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([id]);
+        cache.seed([CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None, // unspent at subscribe time
+        }]);
+        cache.untrack_coins(&[id]); // the `unsubscribe_coins` path
+
+        let (_rt, provider) = provider_with_cache(fetcher_reporting_spent(c, 150, puzzle), cache);
+        let spend = call(move || provider.coin_spend(id))
+            .expect("read ok")
+            .expect("a coin spent after the unsubscribe must still report its spend");
+        assert_eq!(spend.coin, c);
+    }
+
+    /// A coin still covered by a subscribed PUZZLE HASH is RETAINED when its coin-id subscription is
+    /// dropped — the sweep is a coverage rule, not a blind delete of the listed ids.
+    #[test]
+    fn untracking_a_coin_still_covered_by_a_puzzle_hash_retains_it() {
+        let c = coin(23);
+        let id = c.coin_id();
+        let state = CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None,
+        };
+
+        let mut cache = CoinStateCache::new();
+        cache.track_puzzle_hashes([c.puzzle_hash]);
+        cache.track_coins([id]);
+        cache.seed([state]);
+        cache.untrack_coins(&[id]);
+
+        assert_eq!(
+            cache.get(id),
+            Some(state),
+            "a coin under a still-subscribed puzzle hash keeps receiving updates, so it is retained"
+        );
+    }
+
+    /// The SEED-BYPASS route, grounded in its real production instance: a HINTED coin. Subscriptions
+    /// request `include_hinted: true`, and a hinted coin is returned because it is hinted TO the
+    /// subscribed puzzle hash — its OWN `puzzle_hash` is something else (a CAT outer puzzle hash,
+    /// typically). So `apply_update` will never accept an update for it, and a cached copy would be
+    /// frozen at first-subscribe forever. It must not enter the cache at all.
+    #[test]
+    fn a_hinted_coin_outside_the_subscribed_set_is_not_cached_by_seed() {
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let hinted = Coin::new(Bytes32::new([24; 32]), ph, 1); // its own puzzle hash != the subscribed one
+        let id = hinted.coin_id();
+
+        let mut cache = CoinStateCache::new();
+        cache.track_puzzle_hashes([Bytes32::new([0xEE; 32])]); // the hint target, not the coin's ph
+        cache.seed([CoinState {
+            coin: hinted,
+            created_height: Some(10),
+            spent_height: None,
+        }]);
+        assert_eq!(
+            cache.get(id),
+            None,
+            "seed must not smuggle in an uncovered coin"
+        );
+
+        // ...and the provider therefore reads through to the peer, which reports the real spend.
+        let (_rt, provider) =
+            provider_with_cache(fetcher_reporting_spent(hinted, 150, puzzle), cache);
+        assert!(
+            call(move || provider.coin_spend(id))
+                .expect("read ok")
+                .is_some(),
+            "an uncached hinted coin is read live, so its spend is visible"
+        );
+    }
+
+    /// Probe (c) — the DEAD-STREAM route. The drive loop exited, so nothing can update the cache;
+    /// every read must fall through to the peer. A successful re-seed restores cache-first service.
+    #[test]
+    fn a_dead_update_stream_stops_the_cache_answering_until_it_is_re_seeded() {
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let c = Coin::new(Bytes32::new([25; 32]), ph, 1);
+        let id = c.coin_id();
+        let unspent = CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None,
+        };
+
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([id]);
+        cache.seed([unspent]);
+        cache.mark_stream_ended();
+
+        let fetcher = fetcher_reporting_spent(c, 150, puzzle);
+        let reads = fetcher.coin_state_reads.clone();
+        let (_rt, provider) = provider_with_cache(fetcher, cache);
+
+        let p = provider.clone();
+        assert!(
+            call(move || p.coin_spend(id)).expect("read ok").is_some(),
+            "a dead stream must send the read to the peer, which reports the spend"
+        );
+        assert!(
+            reads.load(Ordering::SeqCst) > 0,
+            "the read reached the peer"
+        );
+
+        // A reconnect re-seeds through `subscribe_coins`, which restores liveness.
+        provider
+            .handle
+            .block_on(async { provider.cache.write().await.seed([unspent]) });
+        let before = reads.load(Ordering::SeqCst);
+        let p = provider.clone();
+        assert_eq!(
+            call(move || p.coin_spend(id)).expect("read ok"),
+            None,
+            "after the re-seed the cache answers again (and it says unspent)"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            before,
+            "the re-seeded read is served from cache, with no peer round trip"
+        );
+    }
+
+    /// The wall-clock backstop: a SILENTLY WEDGED connection never closes, so the drive loop never
+    /// exits and `mark_stream_ended` never fires. Silence alone must stop the cache answering.
+    /// Driven by an injected zero-length window, never by elapsing real time.
+    #[test]
+    fn silence_beyond_max_silence_stops_the_cache_answering() {
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let c = Coin::new(Bytes32::new([26; 32]), ph, 1);
+        let id = c.coin_id();
+
+        let mut cache = CoinStateCache::new().with_max_silence(Duration::ZERO);
+        cache.track_coins([id]);
+        cache.seed([CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None,
+        }]);
+
+        let (_rt, provider) = provider_with_cache(fetcher_reporting_spent(c, 150, puzzle), cache);
+        assert!(
+            call(move || provider.coin_spend(id))
+                .expect("read ok")
+                .is_some(),
+            "a wedged connection's stale entry must not answer; the peer reports the spend"
+        );
+    }
+
+    /// The control that keeps the fix from degrading into verify-on-use: a SUBSCRIBED coin on a LIVE
+    /// stream is still served entirely from cache, with ZERO peer round trips.
+    #[test]
+    fn a_subscribed_coin_on_a_live_stream_is_served_with_no_peer_read() {
+        let c = coin(27);
+        let id = c.coin_id();
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([id]);
+        cache.seed([CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None,
+        }]);
+
+        let fetcher = MockFetcher::default();
+        let reads = fetcher.coin_state_reads.clone();
+        let (_rt, provider) = provider_with_cache(fetcher, cache);
+        let record = call(move || provider.coin_record(id))
+            .expect("read ok")
+            .expect("a live subscribed coin is served from cache");
+        assert_eq!(record.confirmed_height, Some(10));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "the subscribed-and-current hot path must not touch the network"
+        );
     }
 
     #[test]
@@ -674,5 +937,346 @@ mod tests {
         let (_rt, provider) = provider_with(MockFetcher::default());
         assert_eq!(provider.provider_info().priority, 20);
         assert_eq!(provider.peak_height().unwrap(), None);
+    }
+}
+
+/// Singleton-lineage resolution, exercised through [`ChiaPeerProvider`] against a SNAPSHOT of real
+/// simulated chain state.
+///
+/// The fixtures are genuine: a real launcher, a real eve, and real recreation spends produced by the
+/// in-process Chia simulator, then served back through the crate's own [`CoinStateFetcher`] seam. So
+/// the walk runs on the production path — `ChiaPeerProvider::coin_record` + `coin_spend`, reveal
+/// verification included — rather than on a direct call into `dig_chainsource_interface`, which
+/// would prove nothing about this crate.
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+    use crate::error::ChiaPeerError;
+    use async_trait::async_trait;
+    use chia_protocol::Coin;
+    use chia_wallet_sdk::chia::puzzle_types::singleton::{SingletonArgs, SingletonSolution};
+    use chia_wallet_sdk::chia::puzzle_types::{EveProof, LineageProof, Memos, Proof};
+    use chia_wallet_sdk::clvm_utils::TreeHash;
+    use chia_wallet_sdk::driver::{
+        Launcher, Layer, SingletonLayer, Spend, SpendContext, SpendWithConditions, StandardLayer,
+    };
+    use chia_wallet_sdk::test::Simulator;
+    use chia_wallet_sdk::types::Conditions;
+    use dig_chainsource_interface::{ProviderId, ProviderKind};
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fetcher answering from a snapshot of real simulated chain state, keyed by coin id.
+    ///
+    /// Unlike the provider module's scripted `MockFetcher`, every read here is per-coin, which is
+    /// what a multi-hop walk needs: hop `n` must see hop `n`'s own spend, never a single canned one.
+    #[derive(Default)]
+    struct ChainSnapshotFetcher {
+        states: HashMap<Bytes32, CoinState>,
+        spends: HashMap<Bytes32, (Program, Program)>,
+        children: HashMap<Bytes32, Vec<CoinState>>,
+        /// When set, this coin's spend read FAILS (an honest source that lost the read), so the
+        /// three-valued discipline can be checked mid-walk rather than only at the first hop.
+        fail_spend_of: Option<Bytes32>,
+        /// How many times the child list was consulted. The canonical walk DERIVES its successor
+        /// from the parent's own spend and must never pick one out of a source-supplied child list,
+        /// so this stays zero.
+        children_reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CoinStateFetcher for ChainSnapshotFetcher {
+        async fn coin_states(
+            &self,
+            coin_ids: Vec<Bytes32>,
+            _subscribe: bool,
+        ) -> Result<Vec<CoinState>, ChiaPeerError> {
+            Ok(coin_ids
+                .into_iter()
+                .filter_map(|id| self.states.get(&id).copied())
+                .collect())
+        }
+
+        async fn puzzle_states(
+            &self,
+            _puzzle_hashes: Vec<Bytes32>,
+            _filters: CoinStateFilters,
+            _subscribe: bool,
+        ) -> Result<Vec<CoinState>, ChiaPeerError> {
+            Ok(Vec::new())
+        }
+
+        async fn children(&self, coin_id: Bytes32) -> Result<Vec<CoinState>, ChiaPeerError> {
+            self.children_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.children.get(&coin_id).cloned().unwrap_or_default())
+        }
+
+        async fn puzzle_and_solution(
+            &self,
+            coin_id: Bytes32,
+            _height: u32,
+        ) -> Result<(Program, Program), ChiaPeerError> {
+            if self.fail_spend_of == Some(coin_id) {
+                return Err(ChiaPeerError::Transport("socket reset".into()));
+            }
+            self.spends
+                .get(&coin_id)
+                .cloned()
+                // The caller reached here only after confirming the coin is spent → fail closed.
+                .ok_or_else(|| ChiaPeerError::Rejected("no reveal".into()))
+        }
+    }
+
+    /// A live singleton in the simulator, tracked as the fixture advances it.
+    struct Singleton {
+        launcher_id: Bytes32,
+        /// Launcher -> ... -> tip, in walk order.
+        trail: Vec<Coin>,
+        proof: Proof,
+        inner_puzzle_hash: Bytes32,
+        pk: chia_wallet_sdk::chia::bls::PublicKey,
+        sk: chia_wallet_sdk::chia::bls::SecretKey,
+    }
+
+    impl Singleton {
+        fn tip(&self) -> Coin {
+            *self.trail.last().expect("a launched singleton has a tip")
+        }
+
+        fn outer_puzzle_hash(&self) -> Bytes32 {
+            SingletonArgs::curry_tree_hash(self.launcher_id, TreeHash::from(self.inner_puzzle_hash))
+                .into()
+        }
+    }
+
+    /// Launches a real singleton with a standard p2 inner puzzle and settles it.
+    fn launch(sim: &mut Simulator, ctx: &mut SpendContext) -> Singleton {
+        let owner = sim.bls(1);
+        let launcher = Launcher::new(owner.coin.coin_id(), 1);
+        let launcher_coin = launcher.coin();
+        let (conditions, eve) = launcher
+            .spend(ctx, owner.puzzle_hash, ())
+            .expect("the launcher spends");
+        StandardLayer::new(owner.pk)
+            .spend(ctx, owner.coin, conditions)
+            .expect("the funding coin spends");
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&owner.sk))
+            .expect("the launch settles");
+
+        Singleton {
+            launcher_id: launcher_coin.coin_id(),
+            trail: vec![launcher_coin, eve],
+            proof: Proof::Eve(EveProof {
+                parent_parent_coin_info: launcher_coin.parent_coin_info,
+                parent_amount: launcher_coin.amount,
+            }),
+            inner_puzzle_hash: owner.puzzle_hash,
+            pk: owner.pk,
+            sk: owner.sk,
+        }
+    }
+
+    /// Advances the singleton by one genuine recreation spend, appending the new tip to the trail.
+    fn advance(sim: &mut Simulator, ctx: &mut SpendContext, singleton: &mut Singleton) {
+        let tip = singleton.tip();
+        let sk = singleton.sk.clone();
+        let conditions =
+            Conditions::new().create_coin(singleton.inner_puzzle_hash, tip.amount, Memos::None);
+        let inner = StandardLayer::new(singleton.pk)
+            .spend_with_conditions(ctx, conditions)
+            .expect("the inner puzzle spends");
+        let layer = SingletonLayer::new(singleton.launcher_id, StandardLayer::new(singleton.pk));
+        let solution = SingletonSolution {
+            lineage_proof: singleton.proof,
+            amount: tip.amount,
+            inner_solution: inner.solution,
+        };
+        let puzzle = layer
+            .construct_puzzle(ctx)
+            .expect("the singleton puzzle builds");
+        let solution = ctx.alloc(&solution).expect("the solution allocates");
+        ctx.spend(tip, Spend::new(puzzle, solution))
+            .expect("the singleton spends");
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&sk))
+            .expect("the recreation settles");
+
+        singleton.proof = Proof::Lineage(LineageProof {
+            parent_parent_coin_info: tip.parent_coin_info,
+            parent_inner_puzzle_hash: singleton.inner_puzzle_hash,
+            parent_amount: tip.amount,
+        });
+        singleton.trail.push(Coin::new(
+            tip.coin_id(),
+            singleton.outer_puzzle_hash(),
+            tip.amount,
+        ));
+    }
+
+    /// Snapshots every coin on `trail` — its state, its spend, and its children — out of the
+    /// simulator, so the fetcher serves real chain data without borrowing the simulator itself.
+    fn snapshot(sim: &Simulator, trail: &[Coin]) -> ChainSnapshotFetcher {
+        let mut fetcher = ChainSnapshotFetcher::default();
+        for coin in trail {
+            let id = coin.coin_id();
+            if let Some(state) = sim.coin_state(id) {
+                fetcher.states.insert(id, state);
+            }
+            if let Some(spend) = sim.coin_spend(id) {
+                fetcher
+                    .spends
+                    .insert(id, (spend.puzzle_reveal, spend.solution));
+            }
+            fetcher.children.insert(id, sim.children(id));
+        }
+        fetcher
+    }
+
+    fn provider_over(
+        fetcher: Arc<ChainSnapshotFetcher>,
+    ) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
+        provider_with_cache(fetcher, CoinStateCache::new())
+    }
+
+    /// Builds a lineage provider over an ARBITRARY, already-populated cache — the seam the custody
+    /// proof needs, since every other builder starts empty and so cannot exercise a lying cache.
+    fn provider_with_cache(
+        fetcher: Arc<ChainSnapshotFetcher>,
+        cache: CoinStateCache,
+    ) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+        let provider = ChiaPeerProvider::new(
+            fetcher,
+            Arc::new(RwLock::new(cache)),
+            rt.handle().clone(),
+            ProviderInfo {
+                id: ProviderId(Cow::Borrowed("chia-peer-lineage-test")),
+                kind: ProviderKind::Custom,
+                priority: 20,
+                trustless: false,
+            },
+        );
+        (rt, provider)
+    }
+
+    /// Runs a sync facade method off any ambient runtime (the bridge's "outside a runtime" path).
+    fn call<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|s| s.spawn(f).join().expect("thread panicked"))
+    }
+
+    /// A multi-hop singleton — launcher, eve, and two genuine recreations — resolves THROUGH the
+    /// provider, with every coin on the trail a member of the returned lineage.
+    #[test]
+    fn a_multi_hop_singleton_resolves_through_the_provider() {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let mut singleton = launch(&mut sim, ctx);
+        advance(&mut sim, ctx, &mut singleton);
+        advance(&mut sim, ctx, &mut singleton);
+        assert_eq!(singleton.trail.len(), 4, "launcher + eve + two recreations");
+
+        let fetcher = Arc::new(snapshot(&sim, &singleton.trail));
+        let (_rt, provider) = provider_over(fetcher.clone());
+        let launcher_id = singleton.launcher_id;
+        let lineage = call(move || provider.resolve_singleton_lineage(launcher_id))
+            .expect("an honest source resolves")
+            .expect("a live singleton has a lineage");
+
+        assert_eq!(lineage.tip(), singleton.tip().coin_id());
+        assert_eq!(lineage.len(), singleton.trail.len());
+        for coin in &singleton.trail {
+            assert!(
+                lineage.contains(coin.coin_id()),
+                "genuine lineage coin {} is missing",
+                coin.coin_id()
+            );
+        }
+        assert_eq!(
+            fetcher.children_reads.load(Ordering::SeqCst),
+            0,
+            "the successor MUST be derived from the parent's own spend, never picked out of a \
+             source-supplied child list"
+        );
+    }
+
+    /// THE CUSTODY PROOF (#2792). The walk is only as honest as the reads under it: a cache that
+    /// still answers for a coin it no longer receives updates for reports that coin as UNSPENT, the
+    /// walk stops there, and a SUPERSEDED coin authenticates as the singleton's tip. That is exactly
+    /// the melt scenario `dig-chainsource-interface-0.3.1/src/walk.rs:539` names — a destroyed
+    /// singleton passing as live.
+    ///
+    /// The pair with `a_multi_hop_singleton_resolves_through_the_provider` (identical chain, EMPTY
+    /// cache) is what discriminates: only the stale-cache variant can expose the lie.
+    #[test]
+    fn a_stale_cache_entry_cannot_authenticate_a_superseded_coin_as_the_tip() {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let mut singleton = launch(&mut sim, ctx);
+        advance(&mut sim, ctx, &mut singleton);
+        advance(&mut sim, ctx, &mut singleton);
+
+        let fetcher = Arc::new(snapshot(&sim, &singleton.trail));
+
+        // The eve is an INTERMEDIATE coin: long spent, but the cache holds its pre-spend state and
+        // has since stopped receiving updates for it.
+        let eve = singleton.trail[1];
+        let eve_id = eve.coin_id();
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([eve_id]);
+        cache.seed([CoinState {
+            coin: eve,
+            created_height: Some(1),
+            spent_height: None,
+        }]);
+        cache.untrack_coins(&[eve_id]);
+
+        let (_rt, provider) = provider_with_cache(fetcher, cache);
+        let launcher_id = singleton.launcher_id;
+        let lineage = call(move || provider.resolve_singleton_lineage(launcher_id))
+            .expect("an honest source resolves")
+            .expect("a live singleton has a lineage");
+
+        assert_eq!(
+            lineage.tip(),
+            singleton.tip().coin_id(),
+            "a stale cache entry must not stop the walk at a superseded coin"
+        );
+        assert_eq!(lineage.len(), singleton.trail.len());
+    }
+
+    /// A launcher id naming no coin is a REAL absence — `Ok(None)`, not an error.
+    #[test]
+    fn a_launcher_id_naming_no_coin_is_a_real_absence() {
+        let (_rt, provider) = provider_over(Arc::new(ChainSnapshotFetcher::default()));
+        let result = call(move || provider.resolve_singleton_lineage(Bytes32::new([0x5A; 32])));
+        assert_eq!(result.expect("a provable absence is not an error"), None);
+    }
+
+    /// A source read that FAILS mid-walk must be `Err(_)` — never collapsed into `Ok(None)`.
+    ///
+    /// The failure is placed on the EVE's spend, after the launcher hop has already succeeded, so a
+    /// walk that returned the partial lineage it had accumulated (or read the failure as "no more
+    /// lineage") would be caught. A transport failure read as an absence is the bug class that
+    /// spends money twice.
+    #[test]
+    fn a_source_failure_mid_walk_is_err_never_a_false_absence() {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let mut singleton = launch(&mut sim, ctx);
+        advance(&mut sim, ctx, &mut singleton);
+
+        let mut fetcher = snapshot(&sim, &singleton.trail);
+        fetcher.fail_spend_of = Some(singleton.trail[1].coin_id()); // the eve's spend
+        let (_rt, provider) = provider_over(Arc::new(fetcher));
+        let launcher_id = singleton.launcher_id;
+        let result = call(move || provider.resolve_singleton_lineage(launcher_id));
+        assert!(
+            matches!(result, Err(ChainSourceError::Transport(_))),
+            "a failed source read MUST be Err, never Ok(None) or a partial lineage: {result:?}"
+        );
     }
 }

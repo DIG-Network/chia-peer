@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "chia-peer"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chia-protocol",
@@ -1111,11 +1111,18 @@ dependencies = [
 
 [[package]]
 name = "dig-chainsource-interface"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18e893e89f6a8033a4083ca34329a0097cc5f65cf2d19dd2b205375c710c1718"
+checksum = "dd547c8e7813320f226fa747e16ab05c3183f41f920204e6bfabb6f36a140115"
 dependencies = [
  "chia-protocol",
+ "chia-puzzle-types",
+ "chia-puzzles",
+ "chia-sdk-driver",
+ "chia-sdk-types",
+ "clvm-traits 0.36.1",
+ "clvm-utils",
+ "clvmr",
  "thiserror 2.0.19",
 ]
 

@@ -25,8 +25,37 @@
 //!   sweeps out any coin now above the (possibly-lowered) peak.
 //!
 //! Together they make the invariant hold after every public mutation regardless of ordering.
+//!
+//! ## The freshness contract (enforced by construction)
+//!
+//! **The cache never serves state it is not still receiving updates for — a cached coin is served
+//! only while it is inside the subscribed set AND the peer's update stream is live; otherwise the
+//! read falls through to the peer.**
+//!
+//! Without it a coin can be reported unspent long after it was spent, and because `coin_spend`
+//! short-circuits off the same cached `spent_height`, both reads agree: the lie is self-consistent.
+//! Under the singleton-lineage walk that means a destroyed (melted) singleton authenticates as live.
+//! Like the invariant above, this is NOT a read-site predicate (that repeatedly missed a path); it is
+//! structural, enforced at three boundaries:
+//! - the **add boundary** — [`CoinStateCache::cache_coin`] refuses a coin outside the subscribed set,
+//!   so `seed` can no longer smuggle in an uncovered (e.g. hinted) coin that no update could correct;
+//! - the **coverage boundary** — [`CoinStateCache::untrack_coins`] sweeps every coin the remaining
+//!   subscriptions no longer cover, so no entry is ever stranded beyond the reach of `apply_update`;
+//! - the **liveness boundary** — [`CoinStateCache::get`] returns `None` unless the cache
+//!   [is live](CoinStateCache::is_live): the peer has made authoritative contact and that contact is
+//!   more recent than the silence backstop. [`CoinStateCache::mark_stream_ended`] clears liveness
+//!   when the drive loop exits; the backstop covers a SILENTLY WEDGED socket, which never closes.
+//!
+//! The subscribed-and-current hot path is untouched: it still answers from memory with no peer round
+//! trip. Only state that has stopped being maintained is refused.
+//!
+//! [`CoinStateCache::peak`] is deliberately NOT gated. Returning `None` there is the tempting
+//! symmetric move and it is wrong: the provider's height clamp short-circuits on `None`, so gating
+//! the peak would DISABLE the clamp and re-open a `peak - height` underflow on the live-fetch path. A
+//! frozen peak clamps harder, which is the conservative direction.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use chia_protocol::{Bytes32, CoinState};
 
@@ -34,8 +63,17 @@ use chia_protocol::{Bytes32, CoinState};
 /// subscription can pull in from an untrusted peer's discovery stream.
 const MAX_COINS_PER_PUZZLE_HASH: usize = 10_000;
 
+/// How long the cache keeps answering after the last authoritative contact with the peer.
+///
+/// WHY this value: the wallet protocol pushes a `NewPeakWallet` on every new block, and Chia's target
+/// block interval is ~18.75s, so a healthy connection contacts us several times a minute. Three
+/// minutes is ~10 missed blocks — far longer than any plausible transient gap, yet short enough that a
+/// silently wedged socket (no FIN, so the drive loop never exits and `mark_stream_ended` never fires)
+/// stops answering within one confirmation window rather than indefinitely.
+const DEFAULT_MAX_SILENCE: Duration = Duration::from_secs(180);
+
 /// A light client's local view of subscribed coin/puzzle-hash state plus the current peak.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CoinStateCache {
     /// Latest known state of every cached coin, keyed by coin id.
     coins: HashMap<Bytes32, CoinState>,
@@ -45,6 +83,24 @@ pub struct CoinStateCache {
     subscribed_puzzle_hashes: HashSet<Bytes32>,
     /// The current peak `(height, header_hash)` learned from `NewPeakWallet`/`CoinStateUpdate`.
     peak: Option<(u32, Bytes32)>,
+    /// When the peer last spoke authoritatively (a subscribe response, a peak, or a state update).
+    /// `None` means the cache is not receiving updates and must not answer reads.
+    last_contact: Option<Instant>,
+    /// How long after `last_contact` the cache keeps answering — the wedged-connection backstop.
+    max_silence: Duration,
+}
+
+impl Default for CoinStateCache {
+    fn default() -> Self {
+        Self {
+            coins: HashMap::new(),
+            subscribed_coins: HashSet::new(),
+            subscribed_puzzle_hashes: HashSet::new(),
+            peak: None,
+            last_contact: None,
+            max_silence: DEFAULT_MAX_SILENCE,
+        }
+    }
 }
 
 impl CoinStateCache {
@@ -53,7 +109,37 @@ impl CoinStateCache {
         Self::default()
     }
 
+    /// Overrides the silence backstop (see [`DEFAULT_MAX_SILENCE`]). Chiefly a test seam, so liveness
+    /// expiry can be exercised deterministically instead of by elapsing real time.
+    pub fn with_max_silence(mut self, max_silence: Duration) -> Self {
+        self.max_silence = max_silence;
+        self
+    }
+
+    /// Whether the cache is still receiving updates and may therefore answer reads: the peer has made
+    /// authoritative contact, and that contact is more recent than [`max_silence`](Self::with_max_silence).
+    pub fn is_live(&self) -> bool {
+        self.last_contact
+            .is_some_and(|at| at.elapsed() < self.max_silence)
+    }
+
+    /// Records authoritative contact with the peer, (re)starting the liveness window.
+    fn note_contact(&mut self) {
+        self.last_contact = Some(Instant::now());
+    }
+
+    /// Declares the peer's update stream ended (the drive loop exited). Every subsequent read falls
+    /// through to a live fetch until a reconnect re-seeds the cache.
+    pub fn mark_stream_ended(&mut self) {
+        self.last_contact = None;
+    }
+
     /// The current peak `(height, header_hash)`, if one has been observed.
+    ///
+    /// Deliberately NOT gated on [liveness](Self::is_live), unlike [`get`](Self::get): the provider's
+    /// height clamp short-circuits when the peak is `None`, so gating this would disable the clamp
+    /// and re-open a `peak - height` (u32) underflow on the live-fetch path. A frozen peak clamps
+    /// HARDER — the conservative direction — so a stale peak is safe where stale coin state is not.
     pub fn peak(&self) -> Option<(u32, Bytes32)> {
         self.peak
     }
@@ -61,11 +147,18 @@ impl CoinStateCache {
     /// Records a new peak observed from a bare `NewPeakWallet` message. ADVANCE-ONLY: a stale,
     /// out-of-order, or hostile lower peak never regresses a higher one.
     pub fn set_peak(&mut self, height: u32, header_hash: Bytes32) {
+        self.note_contact();
         self.update_peak(height, header_hash, false);
     }
 
-    /// The cached state of `coin_id`, if the client holds one.
+    /// The cached state of `coin_id`, if the client holds one AND is still receiving updates for it.
+    ///
+    /// Returns `None` while the cache is not [live](Self::is_live) — the caller then falls through to
+    /// a live peer read. See the module docs' freshness contract.
     pub fn get(&self, coin_id: Bytes32) -> Option<CoinState> {
+        if !self.is_live() {
+            return None;
+        }
         self.coins.get(&coin_id).cloned()
     }
 
@@ -74,6 +167,9 @@ impl CoinStateCache {
     /// Routes through [`cache_coin`](Self::cache_coin), so a seeded coin created above the current
     /// peak is refused (the invariant is enforced on this path too).
     pub fn seed(&mut self, states: impl IntoIterator<Item = CoinState>) {
+        // A subscribe response IS a fresh authoritative read, so it starts the liveness window —
+        // without this a freshly-seeded cache would be dead until the first push arrived.
+        self.note_contact();
         for state in states {
             self.cache_coin(state);
         }
@@ -89,10 +185,26 @@ impl CoinStateCache {
         self.subscribed_puzzle_hashes.extend(puzzle_hashes);
     }
 
-    /// Drops `coin_ids` from the subscription set (their cached state is retained until overwritten).
+    /// Drops `coin_ids` from the subscription set AND sweeps every cached coin the remaining
+    /// subscriptions no longer cover.
+    ///
+    /// Retention would be unsound: `apply_update` only accepts items in the subscribed set, so a
+    /// retained entry is frozen at the instant it stopped being covered and no update can ever
+    /// correct it — including the reorg rollback, which would happily un-spend it. A coin still
+    /// covered by a subscribed PUZZLE HASH is genuinely still updated, so it is RETAINED; the sweep
+    /// is a coverage rule, not a blind delete of the listed ids.
     pub fn untrack_coins(&mut self, coin_ids: &[Bytes32]) {
         for id in coin_ids {
             self.subscribed_coins.remove(id);
+        }
+        let uncovered: Vec<Bytes32> = self
+            .coins
+            .values()
+            .filter(|state| !self.is_subscribed(state))
+            .map(|state| state.coin.coin_id())
+            .collect();
+        for id in uncovered {
+            self.coins.remove(&id);
         }
     }
 
@@ -141,6 +253,8 @@ impl CoinStateCache {
         fork_height: u32,
         peak_hash: Bytes32,
     ) {
+        self.note_contact();
+
         let reasserted: HashSet<Bytes32> = items
             .iter()
             .filter(|s| self.is_subscribed(s))
@@ -185,12 +299,19 @@ impl CoinStateCache {
         }
     }
 
-    /// The ONLY path by which a coin enters the cache. Enforces the two structural bounds:
+    /// The ONLY path by which a coin enters the cache. Enforces the three structural bounds:
+    /// - **Coverage:** refuses a coin outside the subscribed set. `apply_update` already filters its
+    ///   items this way; applying it HERE closes the `seed` bypass, whose live instance is a HINTED
+    ///   coin (returned because it is hinted TO a subscribed puzzle hash, while its own puzzle hash is
+    ///   something else) — cached, it could never be updated again.
     /// - **Invariant:** refuses a coin whose `created_height` is above the current peak (which would
     ///   underflow a consumer's `peak - created` confirmation count).
     /// - **Memory:** refuses a NEW coin once the cache is at [`max_cached_coins`](Self::max_cached_coins)
     ///   (re-asserting an already-cached coin never grows the map).
     fn cache_coin(&mut self, state: CoinState) {
+        if !self.is_subscribed(&state) {
+            return; // never cache state no subscription keeps current
+        }
         if let Some(created) = state.created_height {
             if self
                 .peak

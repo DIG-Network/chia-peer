@@ -1,6 +1,6 @@
 [package]
 name = "chia-peer"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 description = "DIG Chia light-client connectivity: a wallet-protocol full-node client + ChainSource provider (dig-node seam 1)"
 license = "MIT"
@@ -21,7 +21,13 @@ categories = ["api-bindings", "cryptography::cryptocurrencies"]
 # umbrella modules this crate used (`bls`, `ssl`, `traits`, `clvm_utils`) are
 # re-exported by chia-wallet-sdk, which guarantees they are the SAME types the
 # SDK's own `Peer`/`connect_peer` signatures expect.
-dig-chainsource-interface = "0.3"
+#
+# `lineage-walk` supplies the canonical launcher→tip singleton walk this crate's
+# `resolve_singleton_lineage` delegates to. It is a NON-default feature because it pulls a CLVM
+# evaluator (chia-puzzle-types / chia-puzzles / chia-sdk-driver / chia-sdk-types / clvm-traits /
+# clvm-utils / clvmr) — every one of which sits on the same chia-protocol 0.36.1 / SDK 0.34 line
+# this crate already rides, so enabling it moves no other version.
+dig-chainsource-interface = { version = "0.3", features = ["lineage-walk"] }
 chia-protocol = "0.36.1"
 chia-wallet-sdk = { version = "0.34", features = ["native-tls"] }
 tokio = { version = "1", features = ["full"] }
@@ -35,7 +41,7 @@ futures-util = "0.3"
 
 [dev-dependencies]
 # `testing` feature enables the in-memory MockChainSource used by provider tests.
-dig-chainsource-interface = { version = "0.3", features = ["testing"] }
+dig-chainsource-interface = { version = "0.3", features = ["lineage-walk", "testing"] }
 # `peer-simulator` provides an in-process wallet-protocol full node so the peer fetcher + light
 # client are tested end-to-end (connect, subscribe, submit, reorg) without a live network.
 chia-wallet-sdk = { version = "0.34", features = ["native-tls", "peer-simulator"] }

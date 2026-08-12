@@ -256,11 +256,19 @@ fn spawn_drive_loop(
                 _ => {}
             }
         }
+        // The stream ended: nothing can keep the cache current any more, so it must stop answering
+        // reads until a reconnect re-seeds it (#2792). `reconnect` re-arms subscriptions, and each
+        // `seed` restores liveness.
+        cache.write().await.mark_stream_ended();
     })
 }
 
 /// Applies a decoded `CoinStateUpdate` to the cache and stops tracking any coins the update reports
-/// as spent (their state is retained for reads; only the live subscription is dropped locally).
+/// as spent.
+///
+/// Untracking now also EVICTS their cached state (#2792): once the subscription is gone no update can
+/// correct that state — not even a reorg rolling the spend back — so serving it would be serving a
+/// frozen answer. Later reads for a spent coin go live instead.
 async fn apply_coin_state_update(cache: &RwLock<CoinStateCache>, update: CoinStateUpdate) {
     let spent: Vec<Bytes32> = update
         .items
@@ -320,9 +328,13 @@ mod tests {
 
         let cache = cache.read().await;
         assert_eq!(cache.peak(), Some((200, Bytes32::new([0xab; 32]))));
+        // #2792: this assertion used to read `is_some()` ("spent coin state is retained for reads").
+        // That retention is precisely the bug — an untracked coin receives no further updates, so a
+        // retained entry is frozen and a later reorg would even un-spend it. The state is evicted and
+        // subsequent reads go live.
         assert!(
-            cache.get(spent_id).is_some(),
-            "spent coin state is retained for reads"
+            cache.get(spent_id).is_none(),
+            "an untracked coin's state is evicted, never served frozen"
         );
         assert!(
             !cache.is_subscribed_coin(spent_id),
