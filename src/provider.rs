@@ -655,14 +655,12 @@ mod tests {
         );
     }
 
+    /// `block_timestamp` is the ONE read this source genuinely cannot answer: a light client keeps
+    /// no timestamp index. It reports `Unsupported` rather than a false `Ok(None)`, so a composing
+    /// registry falls through to a source that does index timestamps.
     #[test]
-    fn lineage_and_timestamp_are_unsupported_not_false_absence() {
+    fn timestamp_is_unsupported_not_false_absence() {
         let (_rt, provider) = provider_with(MockFetcher::default());
-        let p = provider.clone();
-        assert!(matches!(
-            call(move || p.resolve_singleton_lineage(Bytes32::new([1; 32]))),
-            Err(ChainSourceError::Unsupported(_))
-        ));
         assert!(matches!(
             call(move || provider.block_timestamp(1)),
             Err(ChainSourceError::Unsupported(_))
@@ -674,5 +672,288 @@ mod tests {
         let (_rt, provider) = provider_with(MockFetcher::default());
         assert_eq!(provider.provider_info().priority, 20);
         assert_eq!(provider.peak_height().unwrap(), None);
+    }
+}
+
+/// Singleton-lineage resolution, exercised through [`ChiaPeerProvider`] against a SNAPSHOT of real
+/// simulated chain state.
+///
+/// The fixtures are genuine: a real launcher, a real eve, and real recreation spends produced by the
+/// in-process Chia simulator, then served back through the crate's own [`CoinStateFetcher`] seam. So
+/// the walk runs on the production path — `ChiaPeerProvider::coin_record` + `coin_spend`, reveal
+/// verification included — rather than on a direct call into `dig_chainsource_interface`, which
+/// would prove nothing about this crate.
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+    use crate::error::ChiaPeerError;
+    use async_trait::async_trait;
+    use chia_protocol::Coin;
+    use chia_wallet_sdk::chia::puzzle_types::singleton::{SingletonArgs, SingletonSolution};
+    use chia_wallet_sdk::chia::puzzle_types::{EveProof, LineageProof, Memos, Proof};
+    use chia_wallet_sdk::clvm_utils::TreeHash;
+    use chia_wallet_sdk::driver::{
+        Launcher, Layer, SingletonLayer, Spend, SpendContext, SpendWithConditions, StandardLayer,
+    };
+    use chia_wallet_sdk::test::Simulator;
+    use chia_wallet_sdk::types::Conditions;
+    use dig_chainsource_interface::{ProviderId, ProviderKind};
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fetcher answering from a snapshot of real simulated chain state, keyed by coin id.
+    ///
+    /// Unlike the provider module's scripted `MockFetcher`, every read here is per-coin, which is
+    /// what a multi-hop walk needs: hop `n` must see hop `n`'s own spend, never a single canned one.
+    #[derive(Default)]
+    struct ChainSnapshotFetcher {
+        states: HashMap<Bytes32, CoinState>,
+        spends: HashMap<Bytes32, (Program, Program)>,
+        children: HashMap<Bytes32, Vec<CoinState>>,
+        /// When set, this coin's spend read FAILS (an honest source that lost the read), so the
+        /// three-valued discipline can be checked mid-walk rather than only at the first hop.
+        fail_spend_of: Option<Bytes32>,
+        /// How many times the child list was consulted. The canonical walk DERIVES its successor
+        /// from the parent's own spend and must never pick one out of a source-supplied child list,
+        /// so this stays zero.
+        children_reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CoinStateFetcher for ChainSnapshotFetcher {
+        async fn coin_states(
+            &self,
+            coin_ids: Vec<Bytes32>,
+            _subscribe: bool,
+        ) -> Result<Vec<CoinState>, ChiaPeerError> {
+            Ok(coin_ids
+                .into_iter()
+                .filter_map(|id| self.states.get(&id).copied())
+                .collect())
+        }
+
+        async fn puzzle_states(
+            &self,
+            _puzzle_hashes: Vec<Bytes32>,
+            _filters: CoinStateFilters,
+            _subscribe: bool,
+        ) -> Result<Vec<CoinState>, ChiaPeerError> {
+            Ok(Vec::new())
+        }
+
+        async fn children(&self, coin_id: Bytes32) -> Result<Vec<CoinState>, ChiaPeerError> {
+            self.children_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.children.get(&coin_id).cloned().unwrap_or_default())
+        }
+
+        async fn puzzle_and_solution(
+            &self,
+            coin_id: Bytes32,
+            _height: u32,
+        ) -> Result<(Program, Program), ChiaPeerError> {
+            if self.fail_spend_of == Some(coin_id) {
+                return Err(ChiaPeerError::Transport("socket reset".into()));
+            }
+            self.spends
+                .get(&coin_id)
+                .cloned()
+                // The caller reached here only after confirming the coin is spent → fail closed.
+                .ok_or_else(|| ChiaPeerError::Rejected("no reveal".into()))
+        }
+    }
+
+    /// A live singleton in the simulator, tracked as the fixture advances it.
+    struct Singleton {
+        launcher_id: Bytes32,
+        /// Launcher -> ... -> tip, in walk order.
+        trail: Vec<Coin>,
+        proof: Proof,
+        inner_puzzle_hash: Bytes32,
+        pk: chia_wallet_sdk::chia::bls::PublicKey,
+        sk: chia_wallet_sdk::chia::bls::SecretKey,
+    }
+
+    impl Singleton {
+        fn tip(&self) -> Coin {
+            *self.trail.last().expect("a launched singleton has a tip")
+        }
+
+        fn outer_puzzle_hash(&self) -> Bytes32 {
+            SingletonArgs::curry_tree_hash(self.launcher_id, TreeHash::from(self.inner_puzzle_hash))
+                .into()
+        }
+    }
+
+    /// Launches a real singleton with a standard p2 inner puzzle and settles it.
+    fn launch(sim: &mut Simulator, ctx: &mut SpendContext) -> Singleton {
+        let owner = sim.bls(1);
+        let launcher = Launcher::new(owner.coin.coin_id(), 1);
+        let launcher_coin = launcher.coin();
+        let (conditions, eve) = launcher
+            .spend(ctx, owner.puzzle_hash, ())
+            .expect("the launcher spends");
+        StandardLayer::new(owner.pk)
+            .spend(ctx, owner.coin, conditions)
+            .expect("the funding coin spends");
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&owner.sk))
+            .expect("the launch settles");
+
+        Singleton {
+            launcher_id: launcher_coin.coin_id(),
+            trail: vec![launcher_coin, eve],
+            proof: Proof::Eve(EveProof {
+                parent_parent_coin_info: launcher_coin.parent_coin_info,
+                parent_amount: launcher_coin.amount,
+            }),
+            inner_puzzle_hash: owner.puzzle_hash,
+            pk: owner.pk,
+            sk: owner.sk,
+        }
+    }
+
+    /// Advances the singleton by one genuine recreation spend, appending the new tip to the trail.
+    fn advance(sim: &mut Simulator, ctx: &mut SpendContext, singleton: &mut Singleton) {
+        let tip = singleton.tip();
+        let sk = singleton.sk.clone();
+        let conditions =
+            Conditions::new().create_coin(singleton.inner_puzzle_hash, tip.amount, Memos::None);
+        let inner = StandardLayer::new(singleton.pk)
+            .spend_with_conditions(ctx, conditions)
+            .expect("the inner puzzle spends");
+        let layer = SingletonLayer::new(singleton.launcher_id, StandardLayer::new(singleton.pk));
+        let solution = SingletonSolution {
+            lineage_proof: singleton.proof,
+            amount: tip.amount,
+            inner_solution: inner.solution,
+        };
+        let puzzle = layer.construct_puzzle(ctx).expect("the singleton puzzle builds");
+        let solution = ctx.alloc(&solution).expect("the solution allocates");
+        ctx.spend(tip, Spend::new(puzzle, solution))
+            .expect("the singleton spends");
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&sk))
+            .expect("the recreation settles");
+
+        singleton.proof = Proof::Lineage(LineageProof {
+            parent_parent_coin_info: tip.parent_coin_info,
+            parent_inner_puzzle_hash: singleton.inner_puzzle_hash,
+            parent_amount: tip.amount,
+        });
+        singleton.trail.push(Coin::new(
+            tip.coin_id(),
+            singleton.outer_puzzle_hash(),
+            tip.amount,
+        ));
+    }
+
+    /// Snapshots every coin on `trail` — its state, its spend, and its children — out of the
+    /// simulator, so the fetcher serves real chain data without borrowing the simulator itself.
+    fn snapshot(sim: &Simulator, trail: &[Coin]) -> ChainSnapshotFetcher {
+        let mut fetcher = ChainSnapshotFetcher::default();
+        for coin in trail {
+            let id = coin.coin_id();
+            if let Some(state) = sim.coin_state(id) {
+                fetcher.states.insert(id, state);
+            }
+            if let Some(spend) = sim.coin_spend(id) {
+                fetcher
+                    .spends
+                    .insert(id, (spend.puzzle_reveal, spend.solution));
+            }
+            fetcher.children.insert(id, sim.children(id));
+        }
+        fetcher
+    }
+
+    fn provider_over(fetcher: Arc<ChainSnapshotFetcher>) -> (tokio::runtime::Runtime, ChiaPeerProvider) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+        let provider = ChiaPeerProvider::new(
+            fetcher,
+            Arc::new(RwLock::new(CoinStateCache::new())),
+            rt.handle().clone(),
+            ProviderInfo {
+                id: ProviderId(Cow::Borrowed("chia-peer-lineage-test")),
+                kind: ProviderKind::Custom,
+                priority: 20,
+                trustless: false,
+            },
+        );
+        (rt, provider)
+    }
+
+    /// Runs a sync facade method off any ambient runtime (the bridge's "outside a runtime" path).
+    fn call<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|s| s.spawn(f).join().expect("thread panicked"))
+    }
+
+    /// A multi-hop singleton — launcher, eve, and two genuine recreations — resolves THROUGH the
+    /// provider, with every coin on the trail a member of the returned lineage.
+    #[test]
+    fn a_multi_hop_singleton_resolves_through_the_provider() {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let mut singleton = launch(&mut sim, ctx);
+        advance(&mut sim, ctx, &mut singleton);
+        advance(&mut sim, ctx, &mut singleton);
+        assert_eq!(singleton.trail.len(), 4, "launcher + eve + two recreations");
+
+        let fetcher = Arc::new(snapshot(&sim, &singleton.trail));
+        let (_rt, provider) = provider_over(fetcher.clone());
+        let launcher_id = singleton.launcher_id;
+        let lineage = call(move || provider.resolve_singleton_lineage(launcher_id))
+            .expect("an honest source resolves")
+            .expect("a live singleton has a lineage");
+
+        assert_eq!(lineage.tip(), singleton.tip().coin_id());
+        assert_eq!(lineage.len(), singleton.trail.len());
+        for coin in &singleton.trail {
+            assert!(
+                lineage.contains(coin.coin_id()),
+                "genuine lineage coin {} is missing",
+                coin.coin_id()
+            );
+        }
+        assert_eq!(
+            fetcher.children_reads.load(Ordering::SeqCst),
+            0,
+            "the successor MUST be derived from the parent's own spend, never picked out of a \
+             source-supplied child list"
+        );
+    }
+
+    /// A launcher id naming no coin is a REAL absence — `Ok(None)`, not an error.
+    #[test]
+    fn a_launcher_id_naming_no_coin_is_a_real_absence() {
+        let (_rt, provider) = provider_over(Arc::new(ChainSnapshotFetcher::default()));
+        let result = call(move || provider.resolve_singleton_lineage(Bytes32::new([0x5A; 32])));
+        assert_eq!(result.expect("a provable absence is not an error"), None);
+    }
+
+    /// A source read that FAILS mid-walk must be `Err(_)` — never collapsed into `Ok(None)`.
+    ///
+    /// The failure is placed on the EVE's spend, after the launcher hop has already succeeded, so a
+    /// walk that returned the partial lineage it had accumulated (or read the failure as "no more
+    /// lineage") would be caught. A transport failure read as an absence is the bug class that
+    /// spends money twice.
+    #[test]
+    fn a_source_failure_mid_walk_is_err_never_a_false_absence() {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let mut singleton = launch(&mut sim, ctx);
+        advance(&mut sim, ctx, &mut singleton);
+
+        let mut fetcher = snapshot(&sim, &singleton.trail);
+        fetcher.fail_spend_of = Some(singleton.trail[1].coin_id()); // the eve's spend
+        let (_rt, provider) = provider_over(Arc::new(fetcher));
+        let launcher_id = singleton.launcher_id;
+        let result = call(move || provider.resolve_singleton_lineage(launcher_id));
+        assert!(
+            matches!(result, Err(ChainSourceError::Transport(_))),
+            "a failed source read MUST be Err, never Ok(None) or a partial lineage: {result:?}"
+        );
     }
 }
