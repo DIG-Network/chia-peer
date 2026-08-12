@@ -83,11 +83,43 @@ inbound `Message` stream:
   every peak change (advance or authoritative-reorg lowering, including the first peak-set) sweeps out
   any coin now above the peak. Together they make the property hold after every public mutation
   regardless of ordering.
-- Coins reported as spent are dropped from the local subscription set (their state is retained for
-  reads; only the live subscription is released).
+- Coins reported as spent are dropped from the local subscription set, and their cached state is
+  EVICTED with it (see the freshness contract below); later reads for them go live.
 
 Reads consult the cache first; a miss falls through to a **non-subscribing** peer query, so a read
 never silently grows the subscription set.
+
+### 4.1 Freshness contract (structural, all paths — enforced BY CONSTRUCTION)
+
+**The cache MUST NOT serve state it is not still receiving updates for. A cached coin is served only
+while it is inside the subscribed set AND the peer's update stream is live; otherwise the read MUST
+fall through to the peer.**
+
+A cache that answers without this reports a coin as unspent long after it was spent, and because
+`coin_spend` derives spentness from the same cached `spent_height`, both reads agree — the lie is
+self-consistent. Under §5's singleton-lineage walk a destroyed (melted) singleton then authenticates
+as live. Like the invariant above, this is not a per-call-site check; it holds at three boundaries:
+
+- **Add boundary.** A coin outside the subscribed set is REFUSED entry, on every path including
+  `seed`. Its live instance is a **hinted** coin: subscriptions request `include_hinted: true`, and a
+  hinted coin is returned because it is hinted TO a subscribed puzzle hash while its own puzzle hash
+  is something else — so no `CoinStateUpdate` for it would ever be accepted. Such a coin is therefore
+  no longer cacheable; reads for it are answered live.
+- **Coverage boundary.** Dropping a coin subscription SWEEPS every cached coin the remaining
+  subscriptions no longer cover. A coin still covered by a subscribed puzzle hash is RETAINED — the
+  sweep is a coverage rule, not a delete of the named ids.
+- **Liveness boundary.** A read is answered from cache only while the peer has made authoritative
+  contact — a subscribe response, a peak, or a state update — more recently than a bounded silence
+  window (default 180s, ~10 missed blocks). The drive-loop's exit clears liveness immediately; the
+  silence window additionally covers a silently wedged socket that never closes. A reconnect re-seeds
+  through the subscription re-arm, which restores liveness.
+
+The subscribed-and-current hot path is unaffected: it MUST still be served from memory with no peer
+round trip.
+
+The tracked **peak** is deliberately NOT gated on liveness. §5's height clamp is skipped when the peak
+is unknown, so withholding a stale peak would disable the clamp and re-open the `peak - height` (u32)
+underflow; a frozen peak clamps harder, which is the conservative direction.
 
 ## 5. `ChainSource` provider (fail-closed contract)
 

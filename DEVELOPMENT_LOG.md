@@ -89,3 +89,37 @@ The `ChainSource` trait is synchronous + object-safe; the provider bridges to th
 clear error (never a panic) on a current-thread runtime. Tests drive the sync facade from a plain
 `std::thread` (the bridge's "outside a runtime" path) to avoid `block_in_place` misuse.
 
+
+## A cache that answers without freshness is a third way to take one source's word
+
+The crate is careful about trust: reads are fail-closed, a puzzle reveal must hash to the coin it
+claims, and the lineage walk derives each successor rather than recognising it. All of that guards
+what a source SAYS. None of it guarded the local cache, which used to answer any coin it happened to
+hold — and a cache is one source's word from the PAST, which is worse: it cannot be re-checked, it
+cannot be contradicted, and there is nobody to fail closed against.
+
+The bite is that the lie was self-consistent. `coin_spend` derives spentness from the same cached
+`spent_height` that `coin_record` reports, so both reads agreed that a spent coin was unspent. Under
+the singleton walk that stops the lineage at a superseded coin and authenticates a destroyed (melted)
+singleton as live.
+
+The general rule: **cached state must never outlive the subscription that keeps it current.** There
+were three distinct doors to an entry no update could ever correct, and only the third is obvious:
+
+1. a coin untracked because it was seen spent, then UN-SPENT by a later reorg rollback — the rollback
+   loop happily edited an entry nothing could subsequently re-assert;
+2. an explicit `unsubscribe_coins`, after which the state simply froze;
+3. a HINTED coin admitted by `seed`. Subscriptions request `include_hinted: true`, and a hinted coin
+   is returned because it is hinted TO the subscribed puzzle hash — its own `puzzle_hash` is
+   something else (a CAT outer puzzle hash, typically). `apply_update`'s insert path already filtered
+   on the subscribed set, so such a coin could enter but never be updated. It needs neither a reorg
+   nor an unsubscribe: a plain CAT wallet's first subscribe reaches it.
+
+Refusing to cache a hinted coin is not a lost capability — the read falls through to a live fetch,
+which is the correct answer. Caching it was the defect.
+
+One asymmetry worth keeping: the tracked PEAK is deliberately NOT gated on liveness, even though the
+coin state is. The provider's height clamp short-circuits when the peak is unknown, so withholding a
+stale peak would DISABLE the clamp and re-open a `peak - height` u32 underflow. A frozen peak clamps
+harder — the conservative direction — so staleness is safe there and dangerous in coin state. The
+tempting symmetric move is the wrong one.
