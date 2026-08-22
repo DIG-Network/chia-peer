@@ -1,166 +1,53 @@
 # chia-peer — normative specification
 
-`chia-peer` is a Chia **wallet-protocol light client** for DIG nodes (dig-node seam 1). It configures
-and drives [`chia-wallet-sdk`] to connect to Chia full nodes as a client, subscribe to coin and
-puzzle-hash state, track the peak, handle reorgs, and submit spend bundles, and it exposes its read
-side through the canonical [`dig-chainsource-interface`] `ChainSource` trait. This document is the
-authoritative contract an independent reimplementation could be built against.
+**Status: DEPRECATED as of 0.3.0.** This crate specifies no behaviour of its own.
 
-## 1. Scope and reuse boundary
+## 1. Scope
 
-chia-peer is a **thin wrapper**. The wallet-protocol wire, TLS, websocket transport, DNS-introducer
-discovery, coin-state subscription, and transaction submission are the SDK's; chia-peer MUST NOT
-reimplement them. Each public method wraps a named SDK `Peer` call and adds only DIG glue:
+`chia-peer` 0.3.0 is a **re-export facade**. It contains one source file, declares one dependency,
+and implements nothing. Everything it previously specified — the connection model, the subscription
+cache and its reorg semantics, the `ChainSource` fail-closed contract, spend submission, and the
+error taxonomy — now lives in `chia-query` and is specified by that crate's `SPEC.md`, §§ *Light
+client (native)* and *Behavioral Rules* 5g–5j.
 
-| chia-peer API | wraps SDK call | glue added |
-|---|---|---|
-| `ChiaLightClient::connect` | `connect_peer` (sends `Handshake{ node_type: Wallet }`) | IPv6-first ordering, drive-loop |
-| `subscribe_coins` | `Peer::request_coin_state(subscribe = true)` | subscription tracking + cache seed |
-| `subscribe_puzzle_hashes` | `Peer::request_puzzle_state(subscribe = true)` (paged) | tracking + filter config + cache seed |
-| `submit_spend` | `Peer::send_transaction` | `TransactionAck` → typed `SubmitOutcome` |
-| `unsubscribe_coins` | `Peer::remove_coin_subscriptions` | local untrack |
-| `peak` | (drive-loop over `NewPeakWallet`) | local peak state |
-| `reconnect` | `connect_peer` | backoff-free re-dial + subscription re-arm |
-| `as_chain_source_provider` | — | the sync `ChainSource` facade |
+An implementation seeking the normative contract MUST read `chia-query`'s `SPEC.md`. This document
+states only what remains true of this crate.
 
-chia-peer has **no dependency on chia-query**. chia-query is the aggregating coinset+peer read router;
-chia-peer is one subscribing light-client provider that a registry composes alongside others.
+## 2. Requirements on this crate
 
-## 2. Version pairing (normative)
+1. **It MUST implement nothing.** The crate ships exactly one source file (`src/lib.rs`) containing
+   re-exports, one `const`, one function and its tests. Adding a module of its own reopens the split
+   this crate's deprecation closed (dig_ecosystem#2761). Enforced by
+   `tests::the_crate_ships_exactly_one_source_file`.
+2. **Every re-export of a formerly-owned item MUST carry `#[deprecated]`** naming its canonical
+   `chia_query` path, so a consumer compiling against 0.1/0.2 is told where the item went rather
+   than merely finding that it still resolves.
+3. **It MUST NOT depend on the Chia wallet-protocol stack.** `chia-wallet-sdk`, `chia-protocol`,
+   `dig-chainsource-interface`, `tokio`, `tokio-tungstenite`, `async-trait`, `rand`, `futures-util`
+   and the Linux vendored-OpenSSL block are all removed. Its only dependency is `chia-query`.
+4. **Its `chia-query` requirement MUST be a caret, never an exact-equals.** The `=0.5.1` pin this
+   crate's existence forced on `dig-node-core` is what the fold removed; an exact-equals here would
+   recreate that shape one layer up.
+5. **It MUST NOT reintroduce a dialler.** Opening a Chia wallet-protocol connection is
+   `chia_query::peer::connect`'s alone (chia-query `SPEC.md` rule 5g, the single-dialler invariant).
+6. **It MUST NOT re-export a configuration type for the deleted dialler.** `ChiaPeerConfig`
+   configured a connection this crate no longer makes; a shim accepting an endpoint and a TLS path
+   and ignoring both would be a surface that lies about what it does.
 
-chia-peer depends on `dig-chainsource-interface = 0.3`, `chia-protocol = 0.36.1`, and
-`chia-wallet-sdk = 0.34`. This pairing is REQUIRED: `dig-chainsource-interface 0.3` speaks
-`chia-protocol 0.36.1`, and a wallet-sdk on any other `chia-protocol` line yields
-`Coin`/`CoinSpend`/`Bytes32` types that would NOT unify with the interface the provider implements.
-**A single `chia-protocol` version across the read interface is an invariant**; the SDK version is
-chosen to match the interface's `chia-protocol`, never the other way around.
+## 3. Preserved guarantees
 
-chia-peer MUST NOT depend on the `chia` umbrella crate. The umbrella has no release on the
-`chia-protocol 0.36` line (crates.io jumps 0.32.0 to 0.42.0), so it cannot satisfy the invariant
-above. The four umbrella modules this crate needs are taken from the SDK's re-exports —
-`chia_wallet_sdk::chia::{bls, ssl, traits}` and `chia_wallet_sdk::clvm_utils` — which are by
-construction the same types the SDK's own `Peer`/`connect_peer` signatures expect.
+These are `chia-query`'s to uphold and are restated here only because a consumer migrating across
+the move depends on them:
 
-## 3. Connection model
+- The light-client provider registers at `DEFAULT_PROVIDER_PRIORITY` = **20**, ahead of the
+  coinset.org tier.
+- Reads are **fail-closed**: `Ok(None)`/empty means a source reliably reported absence; a transport,
+  timeout, parse or subscription-gap failure is an `Err` and is NEVER reported as absence.
+- `resolve_singleton_lineage` and `block_timestamp` are `Unsupported` from the light-client source
+  and fall through to an aggregating source.
+- No code path sets a `trusted` flag on a dialled peer. The pool dials with `PeerOptions::default()`.
 
-- **IPv6-first (CLAUDE.md §5.2).** Candidate addresses are ordered so every IPv6 address is dialed
-  before any IPv4 address, and the IPv6 loopback (`::1`) before the IPv4 loopback (`127.0.0.1`).
-  Ordering is a stable partition: no candidate is dropped, so IPv4 remains a full fallback. IPv4 is
-  used only when IPv6 is unreachable.
-- **Endpoint selection.** An explicit `endpoint` (the operator's own node) is the sole candidate and
-  marks the client `trusted`. Otherwise candidates come from the network's DNS introducers, shuffled
-  to spread load, then ordered per the rule above.
-- **TLS.** A configured cert/key pair is loaded; absent one, an ephemeral self-signed Chia identity is
-  generated (the anonymous-read case). `peer_id` derives from the TLS SPKI per the SDK.
-- **Handshake.** `connect_peer` sends `Handshake { node_type: NodeType::Wallet, .. }`; chia-peer never
-  hand-rolls the handshake.
+## 4. Removal
 
-## 4. Subscription cache + peak + reorg semantics
-
-The client keeps a local `CoinStateCache`, updated by a background drive-loop reading the peer's
-inbound `Message` stream:
-
-- **`NewPeakWallet`** advances the tracked peak `(height, header_hash)`. This path is ADVANCE-ONLY: a
-  stale, out-of-order, or hostile lower peak never regresses a higher one.
-- **`CoinStateUpdate`** carries `items`, `height`, `fork_height`, `peak_hash`. It is applied as:
-  1. **Reorg rollback across `fork_height`:** a cached coin *created* above the fork that the update
-     does not re-assert is dropped (it no longer exists); a cached coin *spent* above the fork has its
-     spent height cleared (its spend was rolled back), unless the update re-asserts it.
-  2. **Authoritative overwrite:** every subscribed coin in `items` is admitted through the single
-     cache-add path, which refuses any coin created above the current peak (see the invariant below).
-  3. **Peak update:** an **authoritative reorg** — `fork_height` below the current peak, the rollback
-     in (1) actually changed subscribed state, and the update is well-formed (`height >= fork_height`)
-     — sets the peak DOWN to `(height, peak_hash)`, so confirmation counts do not overstate during a
-     genuine deep down-reorg. A normal forward update, an update that rolls back nothing, or one with
-     `height < fork_height` is advance-only. Peak-lowering adds no trust beyond the coin-state
-     rollback the same update already performs, and a bare `NewPeakWallet` can never lower the peak.
-
-  **Invariant (structural, all paths — enforced BY CONSTRUCTION):** no cached coin ever has
-  `created_height > peak_height`, so a consumer's `peak_height - created_height` (u32) confirmation
-  count can never underflow into a spurious hyper-confirmed value. This is not a per-call-site check;
-  it holds at two boundaries: (a) the **add boundary** — every coin (from `apply_update`'s items AND
-  from `seed`) enters through one helper that refuses an above-peak coin; (b) the **peak boundary** —
-  every peak change (advance or authoritative-reorg lowering, including the first peak-set) sweeps out
-  any coin now above the peak. Together they make the property hold after every public mutation
-  regardless of ordering.
-- Coins reported as spent are dropped from the local subscription set (their state is retained for
-  reads; only the live subscription is released).
-
-Reads consult the cache first; a miss falls through to a **non-subscribing** peer query, so a read
-never silently grows the subscription set.
-
-## 5. `ChainSource` provider (fail-closed contract)
-
-`ChiaPeerProvider` implements `dig_chainsource_interface::{ChainSource, ChainSourceProvider}` as a
-**synchronous** facade over the async client, via an async→sync bridge that requires a **multi-thread**
-tokio runtime and fails closed with a clear error on a current-thread runtime (never a tokio panic).
-
-The fail-closed contract is absolute (interface SPEC §3): `Ok(None)` / an empty `Vec` means the peer
-RELIABLY reported absence; any transport, timeout, rejection, malformed payload, or not-connected
-condition is `Err(_)` — NEVER a false `Ok(None)`. The `ChiaPeerError → ChainSourceError` mapping
-preserves this: every error variant maps to an `Err`, only classifying the reason.
-
-Method behaviour:
-
-| method | behaviour |
-|---|---|
-| `coin_record` | cache, else non-subscribing `request_coin_state`; empty → `Ok(None)` |
-| `coin_records_by_puzzle_hash` | non-subscribing `request_puzzle_state` (paged) |
-| `coin_records_by_parent` | `request_children` |
-| `coin_spend` | resolve the coin (for its real puzzle hash) → if spent, `request_puzzle_and_solution` → `CoinSpend`; unspent/unknown → `Ok(None)` |
-| `parent_spend` | interface default (coin_record + coin_spend) |
-| `peak_height` | tracked peak height, or `Ok(None)` |
-| `resolve_singleton_lineage` | `Err(Unsupported)` — a money-critical forward walk belongs to an aggregating source; a subscription light client MUST NOT answer it partially |
-| `block_timestamp` | `Err(Unsupported)` — a light source keeps no timestamp index |
-
-`Unsupported` is a first-class fail-closed answer; a composing registry falls through to a source that
-supports these reads. Reporting `Unsupported` is REQUIRED over returning an unreliable value.
-
-**Confirmation-height clamp (all read paths — money-path correctness):** every read that surfaces a
-coin's `created_height` as `confirmed_height` (`coin_record`, `coin_records_by_puzzle_hash`,
-`coin_records_by_parent`) MUST report `confirmed_height ≤ peak_height`. The cache path upholds this
-structurally (§4 invariant), but the cache-MISS *live-fetch* path returns the peer's `created_height`
-directly, which — for an unsubscribed coin created in the current tip block, read in the one-block
-window before the drive loop processes the matching `NewPeakWallet` — could exceed the drive-loop-lagged
-peak and underflow a consumer's `peak_height - confirmed_height` (u32) count into a spurious
-hyper-confirmed value. The provider therefore clamps the reported `confirmed_height` to
-`min(created_height, peak_height)`: an above-peak coin reports 0 confirmations (the conservative,
-understating direction) and remains PRESENT (never omitted — the coin genuinely exists). The peak is
-never inflated from a fetched coin (a lying peer must not raise it). When no peak is known yet
-(`peak_height` is `None`), no `peak - confirmed` subtraction is possible and the height is left as
-reported.
-
-**Spend-height clamp (all read paths — money-path correctness):** symmetrically, every read that
-surfaces a coin's `spent_height` (`coin_record`, `coin_records_by_puzzle_hash`, `coin_records_by_parent`)
-MUST report `spent_height ≤ peak_height`. The cache-MISS *live-fetch* path returns the peer's
-`spent_height` directly, which — for a coin spent in the current tip block, read in the one-block window
-before the matching `NewPeakWallet` is processed — could exceed the drive-loop-lagged peak and underflow
-a consumer's `peak_height - spent_height` (u32) spend-depth into a spurious hyper-deep value. The provider
-therefore clamps the reported `spent_height` to `min(spent_height, peak_height)`: an above-peak spent coin
-reports 0 spend-depth (the conservative, understating direction). The clamp bounds only the reported
-HEIGHT — it NEVER changes the spent-vs-unspent flag (`spent_height` stays `Some`, the coin stays marked
-spent), and `coin_spend` decides spentness from the raw peer state (not the clamped record), so its
-behaviour is unaffected. When no peak is known yet (`peak_height` is `None`), the height is left as
-reported.
-
-### Provider descriptor
-
-`provider_info` reports `ProviderKind::LocalNode` when pointed at the operator's own trusted node,
-else `ProviderKind::Custom` (introducer-discovered). `trustless = false` (answers are taken on trust);
-default `priority = 20`.
-
-## 6. Spend submission
-
-`submit_spend` wraps `Peer::send_transaction` and maps the node's `TransactionAck.status` to
-`SubmitOutcome`: `1 → Accepted` (in mempool, pending confirmation), `2 → Pending`, `3 → Failed`,
-other → `Unknown(status)`. Submission is a WRITE path and is deliberately NOT part of the reads-only
-`ChainSource` surface.
-
-## 7. Error taxonomy
-
-`ChiaPeerError`: `Transport`, `Rejected`, `Malformed`, `Timeout`, `PeerDiscoveryFailed`,
-`NotConnected`, `Tls`. Mapping to `ChainSourceError`: `Timeout`/timeout-worded `Transport` → `Timeout`;
-`Malformed` → `Malformed`; all others → `Transport`. No variant is ever collapsed to `Ok(None)`.
-
-[`chia-wallet-sdk`]: https://crates.io/crates/chia-wallet-sdk
-[`dig-chainsource-interface`]: https://crates.io/crates/dig-chainsource-interface
+This facade exists so a consumer of 0.1/0.2 finds a signpost rather than a crate that vanished from
+crates.io, which is irreversible. It MUST NOT gain features.

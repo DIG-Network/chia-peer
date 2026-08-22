@@ -1,47 +1,22 @@
 [package]
 name = "chia-peer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "DIG Chia light-client connectivity: a wallet-protocol full-node client + ChainSource provider (dig-node seam 1)"
+description = "DEPRECATED — folded into chia-query. A thin re-export facade over chia_query::peer::light_client"
 license = "MIT"
 repository = "https://github.com/DIG-Network/chia-peer"
 readme = "README.md"
-keywords = ["chia", "blockchain", "light-client", "wallet-protocol", "peer"]
+keywords = ["chia", "deprecated", "light-client", "peer", "chia-query"]
 categories = ["api-bindings", "cryptography::cryptocurrencies"]
 
 [dependencies]
-# The canonical reads-only ChainSource provider interface this crate implements.
-# `chia-protocol` is pulled in directly so the provider speaks the exact
-# `chia_protocol` types the interface exposes (cargo unifies it with the SDK's
-# re-export at the same 0.36.x).
+# The ONLY dependency, and deliberately so: this crate implements nothing and exists to point at
+# the crate that does (dig_ecosystem#2761). The whole wallet-protocol stack it used to carry —
+# `chia-wallet-sdk`, `chia-protocol`, `dig-chainsource-interface`, tokio, tokio-tungstenite,
+# async-trait, rand, futures-util, and the Linux vendored-OpenSSL block — is gone, because the code
+# that needed it is gone.
 #
-# There is deliberately NO `chia` umbrella dependency: the umbrella crate has no
-# 0.36 release (crates.io jumps 0.32.0 -> 0.42.0), so it cannot be held on the
-# `chia-protocol 0.36.1` line the interface and the SDK both require. The four
-# umbrella modules this crate used (`bls`, `ssl`, `traits`, `clvm_utils`) are
-# re-exported by chia-wallet-sdk, which guarantees they are the SAME types the
-# SDK's own `Peer`/`connect_peer` signatures expect.
-dig-chainsource-interface = "0.3"
-chia-protocol = "0.36.1"
-chia-wallet-sdk = { version = "0.34", features = ["native-tls"] }
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
-async-trait = "0.1"
-thiserror = "2"
-hex = "0.4"
-log = "0.4"
-rand = "0.8"
-futures-util = "0.3"
-
-[dev-dependencies]
-# `testing` feature enables the in-memory MockChainSource used by provider tests.
-dig-chainsource-interface = { version = "0.3", features = ["testing"] }
-# `peer-simulator` provides an in-process wallet-protocol full node so the peer fetcher + light
-# client are tested end-to-end (connect, subscribe, submit, reorg) without a live network.
-chia-wallet-sdk = { version = "0.34", features = ["native-tls", "peer-simulator"] }
-
-# Linux-only vendored OpenSSL for the native TLS stack (matches chia-query's
-# native build so CI links the same way).
-[target.'cfg(target_os = "linux")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
-openssl-sys = { version = "0.9", features = ["vendored"] }
+# A caret requirement, not an exact-equals. The `=0.5.1` pin this crate's existence forced on
+# `dig-node-core` is exactly what the fold removed, and reintroducing that shape here would recreate
+# it one layer up.
+chia-query = "0.15"
