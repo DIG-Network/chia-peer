@@ -48,6 +48,9 @@ let provider = light.as_chain_source_provider(handle).await;
 | `ChiaPeerError` | `chia_query::peer::light_client::error::LightClientError` |
 | `client.reconnect()` | `ChiaLightClient::reconnect` — now a re-arm, not a dial |
 | *(nothing)* | `ChiaLightClient::needs_rearm` — a followed session that ended is now reported |
+| `ChiaNetwork` | `NetworkType` (already re-exported by this crate) |
+| `CoinStateFetcher` | `chia_query::peer::light_client::fetcher::CoinStateFetcher` — reachable via the re-exported `light_client` module, but no longer at the crate root |
+| `PeerFetcher` | *(deleted)* — it held a `Peer` of its own and dialled to get it; the pooled light client borrows a session instead, so the type has no meaning after the fold |
 
 `ChiaPeerConfig` has **no re-export and no shim**. It configured a dialler, and there is no longer a
 dialler here to configure; a type that pretended otherwise would accept an endpoint and a TLS path

@@ -33,6 +33,13 @@ states only what remains true of this crate.
 6. **It MUST NOT re-export a configuration type for the deleted dialler.** `ChiaPeerConfig`
    configured a connection this crate no longer makes; a shim accepting an endpoint and a TLS path
    and ignoring both would be a surface that lies about what it does.
+7. **Every formerly-public item (from 0.1/0.2 public surfaces) MUST be named in the `# Migration`
+   table in `src/lib.rs` with either (a) its new path in `chia-query` with a link, or (b) an
+   explicit statement that it has no replacement and why.** This table is the signpost the facade
+   exists to provide (rule 4, removal, below). Absence from the table nullifies the signpost for
+   that item and breaks the contract that a consumer of 0.1/0.2 "finds a signpost rather than a
+   crate that vanished." An item neither re-exported nor named in the table is invisible to a
+   migrating consumer.
 
 ## 3. Preserved guarantees
 
